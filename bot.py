@@ -2,7 +2,12 @@ import asyncio
 import sqlite3
 import logging
 import os
+import re
+import imaplib
 from datetime import datetime, timedelta
+from email import message_from_bytes
+from email.header import decode_header
+from email.utils import parsedate_to_datetime
 
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet, InvalidToken
@@ -90,6 +95,197 @@ def decrypt(encrypted: str | None) -> str | None:
         return cipher.decrypt(encrypted.encode()).decode()
     except InvalidToken:
         return "[ошибка расшифровки — старый формат]"
+
+# ────────────────────────────────────────────────
+#  IMAP: получение кодов из писем
+# ────────────────────────────────────────────────
+
+def _detect_imap_hosts(email_address: str) -> list[tuple[str, int]]:
+    email_address = (email_address or "").lower().strip()
+    if email_address.endswith("@gmail.com"):
+        return [("imap.gmail.com", 993)]
+    if email_address.endswith("@proton.me") or email_address.endswith("@protonmail.com") or email_address.endswith("@pm.me"):
+        # В зависимости от страны/настроек могут отличаться хосты
+        return [("imap.proton.me", 993), ("imap.protonmail.com", 993)]
+    return []
+
+
+def _decode_mime_words(s: str | None) -> str:
+    if not s:
+        return ""
+    decoded_parts = decode_header(s)
+    out = []
+    for part, enc in decoded_parts:
+        if isinstance(part, bytes):
+            try:
+                out.append(part.decode(enc or "utf-8", errors="replace"))
+            except Exception:
+                out.append(part.decode("utf-8", errors="replace"))
+        else:
+            out.append(str(part))
+    return "".join(out)
+
+
+def _extract_text_from_email_bytes(raw: bytes) -> tuple[str, str, str]:
+    """
+    Returns: (subject, from_, body_text)
+    """
+    msg = message_from_bytes(raw)
+    subject = _decode_mime_words(msg.get("Subject"))
+    from_ = _decode_mime_words(msg.get("From"))
+
+    parts_text: list[str] = []
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = (part.get_content_type() or "").lower()
+            if ctype not in ("text/plain", "text/html"):
+                continue
+            payload = part.get_payload(decode=True)
+            if payload is None:
+                continue
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                txt = payload.decode(charset, errors="replace")
+            except Exception:
+                txt = payload.decode("utf-8", errors="replace")
+            # Если HTML — вычистим теги (регекс по цифрам всё равно сработает)
+            if ctype == "text/html":
+                txt = re.sub(r"<[^>]+>", " ", txt)
+            parts_text.append(txt)
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or "utf-8"
+            try:
+                parts_text.append(payload.decode(charset, errors="replace"))
+            except Exception:
+                parts_text.append(payload.decode("utf-8", errors="replace"))
+
+    body_text = "\n".join(parts_text).strip()
+    return subject, from_, body_text
+
+
+def _extract_codes(subject: str, from_: str, body_text: str) -> dict[str, str]:
+    """
+    Extracts numeric codes from email text.
+    Returns may contain: steamguard (5 digits), faceit (6 digits).
+    """
+    hay = (subject + "\n" + from_ + "\n" + body_text).lower()
+
+    steam_code = None
+    faceit_code = None
+
+    # SteamGuard обычно 5-значный код
+    if "steam" in hay or "guard" in hay or "verification" in hay:
+        m = re.search(r"\b(\d{5})\b", hay)
+        if m:
+            steam_code = m.group(1)
+
+    # Faceit обычно 6-значный код
+    if "faceit" in hay or "security code" in hay or "verification" in hay:
+        m = re.search(r"\b(\d{6})\b", hay)
+        if m:
+            faceit_code = m.group(1)
+
+    # Fallback: если ключевых слов не было, всё равно попробуем вытащить первые совпадения
+    if steam_code is None:
+        m = re.search(r"\b(\d{5})\b", hay)
+        if m:
+            steam_code = m.group(1)
+    if faceit_code is None:
+        m = re.search(r"\b(\d{6})\b", hay)
+        if m:
+            faceit_code = m.group(1)
+
+    res: dict[str, str] = {}
+    if steam_code:
+        res["steamguard"] = steam_code
+    if faceit_code:
+        res["faceit"] = faceit_code
+    return res
+
+
+def _imap_wait_for_codes_sync(
+    email_address: str,
+    email_password: str,
+    timeout_s: int = 10 * 60,
+    interval_s: int = 20,
+) -> dict[str, str]:
+    hosts = _detect_imap_hosts(email_address)
+    if not hosts:
+        raise RuntimeError(f"Неизвестный IMAP-хост для email: {email_address}")
+
+    end_at = datetime.now().timestamp() + timeout_s
+    last_error: Exception | None = None
+
+    for host, port in hosts:
+        try:
+            imap = imaplib.IMAP4_SSL(host, port)
+            imap.login(email_address, email_password)
+            imap.select("INBOX")
+
+            typ, data = imap.uid("search", None, "ALL")
+            uids = (data[0] or b"").split()
+            baseline_uid = int(uids[-1]) if uids else 0
+
+            while datetime.now().timestamp() < end_at:
+                # Ищем письма, которые пришли после baseline_uid
+                search_query = f"(UID {baseline_uid + 1}:*)"
+                typ, data = imap.uid("search", None, search_query)
+                new_uids = (data[0] or b"").split()
+
+                for uid_bytes in new_uids:
+                    uid = int(uid_bytes)
+                    typ, msg_data = imap.uid("fetch", str(uid), "(RFC822)")
+                    if typ != "OK" or not msg_data:
+                        continue
+                    # msg_data обычно: [(b'UID ...', b'raw_bytes'), b')']
+                    raw = None
+                    for part in msg_data:
+                        if isinstance(part, tuple) and len(part) >= 2:
+                            raw = part[1]
+                            break
+                    if not raw:
+                        continue
+
+                    subject, from_, body_text = _extract_text_from_email_bytes(raw)
+                    codes = _extract_codes(subject, from_, body_text)
+                    if codes:
+                        # Помечаем как прочитанное, чтобы не повторять
+                        try:
+                            imap.uid("store", str(uid), "+FLAGS", "\\\\Seen")
+                        except Exception:
+                            pass
+                        return codes
+
+                # Обновляем baseline_uid на случай, если приходят письма без кода
+                if new_uids:
+                    baseline_uid = max(int(x) for x in new_uids)
+
+                import time
+                time.sleep(interval_s)
+
+            raise TimeoutError("Код(ы) не найден(ы) за время ожидания")
+        except Exception as e:
+            last_error = e
+            continue
+
+    raise RuntimeError(f"IMAP error: {last_error}")
+
+
+async def wait_for_email_codes(
+    email_address: str,
+    email_password: str,
+    timeout_s: int = 10 * 60,
+    interval_s: int = 20,
+) -> dict[str, str]:
+    return await asyncio.to_thread(
+        _imap_wait_for_codes_sync,
+        email_address,
+        email_password,
+        timeout_s,
+        interval_s,
+    )
 
 # ────────────────────────────────────────────────
 #  База данных
@@ -534,7 +730,7 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
             # Отправляем администратору только Steam логин/пароль для покупателя
             cursor.execute(
                 """
-                SELECT steam_login, steam_password
+                SELECT steam_login, steam_password, email, email_password
                   FROM accounts
                  WHERE id = ?
                 """,
@@ -542,14 +738,46 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
             )
             row = cursor.fetchone()
             if row:
-                s_login, s_pw_enc = row
+                s_login, s_pw_enc, email, e_pw_enc = row
                 s_pw = decrypt(s_pw_enc)
+                e_pw = decrypt(e_pw_enc)
 
                 await message.answer(
                     "Данные для покупателя:\n"
                     f"Steam логин: {s_login}\n"
                     f"Steam пароль: {s_pw}"
                 )
+
+                if not email or not e_pw or e_pw.startswith("[ошибка"):
+                    await message.answer(
+                        "Коды не удалось получить: email/пароль для IMAP отсутствует или не расшифровался.",
+                        reply_markup=main_menu,
+                    )
+                else:
+                    await message.answer(
+                        f"Ожидаю коды SteamGuard/Faceit на email: {email} (до 10 минут)..."
+                    )
+                    try:
+                        codes = await wait_for_email_codes(
+                            email_address=email,
+                            email_password=e_pw,
+                            timeout_s=10 * 60,
+                            interval_s=20,
+                        )
+                        if codes:
+                            parts = []
+                            if "steamguard" in codes:
+                                parts.append(f"SteamGuard: {codes['steamguard']}")
+                            if "faceit" in codes:
+                                parts.append(f"Faceit: {codes['faceit']}")
+                            await message.answer("Коды получены:\n" + "\n".join(parts))
+                        else:
+                            await message.answer("Коды не найдены в ожидаемый период.")
+                    except Exception as e:
+                        logging.error(f"imap wait error: {e}")
+                        await message.answer(
+                            "Ошибка при получении кодов с почты (IMAP). Проверьте IMAP доступ и пароль приложения."
+                        )
     except Exception as e:
         conn.rollback()
         logging.error(f"rent error: {e}")
