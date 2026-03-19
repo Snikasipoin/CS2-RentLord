@@ -20,13 +20,65 @@ from aiogram.fsm.context import FSMContext
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)
+ADMIN_ID_RAW = os.getenv("ADMIN_ID") or ""
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 
-if not all([TOKEN, ADMIN_ID, ENCRYPTION_KEY]):
-    raise SystemExit("❌ В .env должны быть BOT_TOKEN, ADMIN_ID, ENCRYPTION_KEY")
+def _parse_admin_ids(raw: str) -> list[int]:
+    # Поддержка формата:
+    #   ADMIN_ID=123456789
+    #   ADMIN_ID=123456789,987654321,555666777
+    #   ADMIN_ID=123456789 987654321 (через пробелы тоже)
+    parts = (
+        raw.replace(";", ",")
+            .replace("\n", " ")
+            .replace("\r", " ")
+            .replace("\t", " ")
+            .split(",")
+    )
+    ids: list[int] = []
+    for part in parts:
+        for token in part.split():
+            token = token.strip()
+            if not token:
+                continue
+            if not token.isdigit():
+                raise SystemExit(f"❌ ADMIN_ID содержит нечисловой идентификатор: {token!r}")
+            ids.append(int(token))
+    return ids
 
-cipher = Fernet(ENCRYPTION_KEY.encode())
+ADMIN_IDS = _parse_admin_ids(ADMIN_ID_RAW)
+
+if not all([TOKEN, ADMIN_IDS, ENCRYPTION_KEY]):
+    raise SystemExit("❌ В .env должны быть BOT_TOKEN, ADMIN_ID (можно несколько через запятую), ENCRYPTION_KEY")
+
+def _normalize_fernet_key(key: str) -> bytes:
+    """
+    Fernet key должна быть base64url строкой (обычно 44 символа, заканчивается на '=')
+    Иногда в .env ключ копируют без padding или с пробелами/кавычками.
+    """
+    k = (key or "").strip()
+
+    # Уберём возможные обрамляющие кавычки
+    if (k.startswith('"') and k.endswith('"')) or (k.startswith("'") and k.endswith("'")):
+        k = k[1:-1]
+
+    # Уберём пробелы/переносы строк внутри
+    k = "".join(k.split())
+
+    # Добавим padding base64url, если не кратно 4
+    rem = len(k) % 4
+    if rem:
+        k = k + ("=" * (4 - rem))
+
+    return k.encode()
+
+try:
+    cipher = Fernet(_normalize_fernet_key(ENCRYPTION_KEY))
+except Exception as e:
+    raise SystemExit(
+        "❌ ENCRYPTION_KEY не является корректным Fernet-ключом. "
+        "Проверьте переменную окружения/файл .env (ключ Fernet.generate_key())."
+    ) from e
 
 def encrypt(text: str | None) -> str | None:
     if text is None: return None
@@ -104,6 +156,9 @@ class ExtendAccount(StatesGroup):
 class FreeAccount(StatesGroup):
     select_account = State()
 
+class AccountDetails(StatesGroup):
+    select_account = State()
+
 # ────────────────────────────────────────────────
 #  Бот и клавиатуры
 # ────────────────────────────────────────────────
@@ -161,7 +216,7 @@ async def cancel_any_state(message: types.Message, state: FSMContext):
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if message.from_user.id not in ADMIN_IDS:
         return
     clean_invalid_dates()
     await message.answer("Добро пожаловать в панель аренды", reply_markup=main_menu)
@@ -172,7 +227,7 @@ async def cmd_start(message: types.Message):
 
 @dp.message(F.text == "➕ Добавить")
 async def add_start(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID: return
+    if message.from_user.id not in ADMIN_IDS: return
     await state.set_state(AddAccount.steam_login)
     await message.answer("Логин Steam:", reply_markup=cancel_kb)
 
@@ -286,18 +341,20 @@ async def add_confirm(message: types.Message, state: FSMContext):
 # ────────────────────────────────────────────────
 
 @dp.message(F.text == "📦 Аккаунты")
-async def show_accounts(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
+async def show_accounts(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
     clean_invalid_dates()
 
-    cursor.execute("SELECT steam_login, status, rent_end FROM accounts ORDER BY steam_login")
+    cursor.execute("SELECT id, steam_login, status, rent_end FROM accounts ORDER BY steam_login")
     rows = cursor.fetchall()
 
     if not rows:
         return await message.answer("Аккаунтов нет", reply_markup=main_menu)
 
     lines = []
-    for login, st, end in rows:
+    rows_data = []
+    for aid, login, st, end in rows:
+        rows_data.append({"id": aid, "login": login, "status": st, "end": end})
         if st == "free":
             lines.append(f"🟢 {login}")
         else:
@@ -308,7 +365,81 @@ async def show_accounts(message: types.Message):
             except:
                 lines.append(f"🟢 {login} (ошибка даты)")
 
-    await message.answer("\n".join(lines) or "Пусто", reply_markup=main_menu)
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=acc["login"])] for acc in rows_data] + [[KeyboardButton(text="Отмена")]],
+        resize_keyboard=True
+    )
+    await state.set_state(AccountDetails.select_account)
+    await state.update_data(accounts=rows_data)
+    await message.answer(
+        (("\n".join(lines) or "Пусто") + "\n\nВыберите аккаунт для просмотра данных:"),
+        reply_markup=kb,
+    )
+
+
+@dp.message(StateFilter(AccountDetails.select_account))
+async def show_account_details(message: types.Message, state: FSMContext):
+    login = (message.text or "").strip()
+    data = await state.get_data()
+    rows = data.get("accounts", [])
+
+    chosen = next((r for r in rows if r.get("login") == login), None)
+    if chosen is None:
+        await state.clear()
+        return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+    aid = chosen["id"]
+
+    cursor.execute(
+        """
+        SELECT steam_login, steam_password, email, email_password, faceit_email, faceit_password, status, rent_end
+          FROM accounts
+         WHERE id = ?
+        """,
+        (aid,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        await state.clear()
+        return await message.answer("Ошибка: аккаунт не найден в базе.", reply_markup=main_menu)
+
+    s_login, s_pw_enc, email, e_pw_enc, f_email, f_pw_enc, st, rent_end = row
+    s_pw = decrypt(s_pw_enc)
+    e_pw = decrypt(e_pw_enc)
+    f_pw = decrypt(f_pw_enc) if f_pw_enc is not None else None
+
+    details_lines = [
+        f"Данные аккаунта: {s_login}",
+        f"Статус: {st}",
+        "",
+        "Steam:",
+        f"  Логин: {s_login}",
+        f"  Пароль: {s_pw}",
+        "",
+        "Email:",
+        f"  Адрес: {email or '-'}",
+        f"  Пароль: {e_pw or '-'}",
+    ]
+
+    if f_email:
+        details_lines.extend([
+            "",
+            "Faceit:",
+            f"  Email: {f_email}",
+            f"  Пароль: {f_pw or '-'}",
+        ])
+
+    # Пара строк про аренду — удобно, но не обязательно
+    if st == "busy" and rent_end:
+        try:
+            dt = datetime.fromisoformat(rent_end)
+            mins = max(0, int((dt - datetime.now()).total_seconds() / 60))
+            details_lines.extend(["", f"До конца аренды: ~{mins} мин"])
+        except Exception:
+            pass
+
+    await state.clear()
+    await message.answer("\n".join(details_lines), reply_markup=main_menu)
 
 # ────────────────────────────────────────────────
 #  Статус
@@ -316,7 +447,7 @@ async def show_accounts(message: types.Message):
 
 @dp.message(F.text == "📊 Статус")
 async def show_status(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
+    if message.from_user.id not in ADMIN_IDS: return
     clean_invalid_dates()
     cursor.execute("SELECT COUNT(*) FROM accounts WHERE status='free'")
     free = cursor.fetchone()[0]
@@ -330,7 +461,7 @@ async def show_status(message: types.Message):
 
 @dp.message(F.text == "🎮 Сдать")
 async def rent_start(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID: return
+    if message.from_user.id not in ADMIN_IDS: return
     clean_invalid_dates()
 
     cursor.execute("SELECT id, steam_login FROM accounts WHERE status='free' ORDER BY steam_login")
@@ -400,10 +531,10 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
                 reply_markup=main_menu
             )
 
-            # Отправляем администратору все данные аккаунта для передачи покупателю
+            # Отправляем администратору только Steam логин/пароль для покупателя
             cursor.execute(
                 """
-                SELECT steam_login, steam_password, email, email_password, faceit_email, faceit_password
+                SELECT steam_login, steam_password
                   FROM accounts
                  WHERE id = ?
                 """,
@@ -411,32 +542,14 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
             )
             row = cursor.fetchone()
             if row:
-                s_login, s_pw_enc, email, e_pw_enc, f_email, f_pw_enc = row
+                s_login, s_pw_enc = row
                 s_pw = decrypt(s_pw_enc)
-                e_pw = decrypt(e_pw_enc)
-                f_pw = decrypt(f_pw_enc) if f_pw_enc is not None else None
 
-                details_lines = [
-                    "Данные для покупателя:",
-                    "",
-                    f"Steam:",
-                    f"  Логин: {s_login}",
-                    f"  Пароль: {s_pw}",
-                    "",
-                    f"Email:",
-                    f"  Адрес: {email}",
-                    f"  Пароль: {e_pw}",
-                ]
-
-                if f_email:
-                    details_lines.extend([
-                        "",
-                        f"Faceit:",
-                        f"  Email: {f_email}",
-                        f"  Пароль: {f_pw}",
-                    ])
-
-                await message.answer("\n".join(details_lines))
+                await message.answer(
+                    "Данные для покупателя:\n"
+                    f"Steam логин: {s_login}\n"
+                    f"Steam пароль: {s_pw}"
+                )
     except Exception as e:
         conn.rollback()
         logging.error(f"rent error: {e}")
@@ -450,7 +563,7 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "✅ Освободить")
 async def free_start(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID: return
+    if message.from_user.id not in ADMIN_IDS: return
     clean_invalid_dates()
 
     cursor.execute("SELECT id, steam_login FROM accounts WHERE status='busy' ORDER BY steam_login")
@@ -492,7 +605,7 @@ async def free_select(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "⏱ Продлить")
 async def extend_start(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID: return
+    if message.from_user.id not in ADMIN_IDS: return
     clean_invalid_dates()
 
     cursor.execute("SELECT id, steam_login, rent_end FROM accounts WHERE status='busy' ORDER BY steam_login")
@@ -589,11 +702,13 @@ async def checker_loop():
                     end = datetime.fromisoformat(row[2])
                     left = (end - datetime.now()).total_seconds()
                     if 240 < left < 300:
-                        await bot.send_message(ADMIN_ID, f"⚠️ {row[1]} — ~5 минут до конца")
+                        for admin_id in ADMIN_IDS:
+                            await bot.send_message(admin_id, f"⚠️ {row[1]} — ~5 минут до конца")
                     if left <= 0:
                         cursor.execute("UPDATE accounts SET status='free', rent_end=NULL WHERE id=?", (row[0],))
                         conn.commit()
-                        await bot.send_message(ADMIN_ID, f"✅ {row[1]} освобождён автоматически")
+                        for admin_id in ADMIN_IDS:
+                            await bot.send_message(admin_id, f"✅ {row[1]} освобождён автоматически")
                 except:
                     pass
         except Exception as e:
