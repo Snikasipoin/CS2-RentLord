@@ -110,6 +110,60 @@ def _detect_imap_hosts(email_address: str) -> list[tuple[str, int]]:
     return []
 
 
+def _normalize_imap_host(host: str | None) -> str | None:
+    host = (host or "").strip().lower()
+    if not host:
+        return None
+    if host.startswith("imap://"):
+        host = host[7:]
+    if host.startswith("imaps://"):
+        host = host[8:]
+    return host.strip("/")
+
+
+def _normalize_imap_port(port: int | str | None) -> int:
+    if port in (None, "", "-"):
+        return 993
+    return int(port)
+
+
+def _build_imap_hosts(
+    email_address: str,
+    imap_host: str | None = None,
+    imap_port: int | str | None = None,
+) -> list[tuple[str, int]]:
+    candidates: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+
+    def add_candidate(host: str | None, port: int | str | None = 993):
+        normalized_host = _normalize_imap_host(host)
+        if not normalized_host:
+            return
+        try:
+            normalized_port = _normalize_imap_port(port)
+        except (TypeError, ValueError):
+            return
+        item = (normalized_host, normalized_port)
+        if item not in seen:
+            seen.add(item)
+            candidates.append(item)
+
+    add_candidate(imap_host, imap_port)
+
+    for host, port in _detect_imap_hosts(email_address):
+        add_candidate(host, port)
+
+    domain = ""
+    if "@" in (email_address or ""):
+        domain = email_address.rsplit("@", 1)[1].strip().lower()
+
+    if domain:
+        for guessed_host in (f"imap.{domain}", f"mail.{domain}", domain):
+            add_candidate(guessed_host, 993)
+
+    return candidates
+
+
 def _decode_mime_words(s: str | None) -> str:
     if not s:
         return ""
@@ -208,10 +262,12 @@ def _extract_codes(subject: str, from_: str, body_text: str) -> dict[str, str]:
 def _imap_wait_for_codes_sync(
     email_address: str,
     email_password: str,
+    imap_host: str | None = None,
+    imap_port: int | str | None = None,
     timeout_s: int = 10 * 60,
     interval_s: int = 20,
 ) -> dict[str, str]:
-    hosts = _detect_imap_hosts(email_address)
+    hosts = _build_imap_hosts(email_address, imap_host=imap_host, imap_port=imap_port)
     if not hosts:
         raise RuntimeError(f"Неизвестный IMAP-хост для email: {email_address}")
 
@@ -276,6 +332,8 @@ def _imap_wait_for_codes_sync(
 async def wait_for_email_codes(
     email_address: str,
     email_password: str,
+    imap_host: str | None = None,
+    imap_port: int | str | None = None,
     timeout_s: int = 10 * 60,
     interval_s: int = 20,
 ) -> dict[str, str]:
@@ -283,6 +341,8 @@ async def wait_for_email_codes(
         _imap_wait_for_codes_sync,
         email_address,
         email_password,
+        imap_host,
+        imap_port,
         timeout_s,
         interval_s,
     )
@@ -301,6 +361,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     steam_password  TEXT,
     email           TEXT,
     email_password  TEXT,
+    imap_host       TEXT,
+    imap_port       INTEGER,
     faceit_email    TEXT,
     faceit_password TEXT,
     status          TEXT DEFAULT 'free',
@@ -308,6 +370,18 @@ CREATE TABLE IF NOT EXISTS accounts (
 )
 """)
 conn.commit()
+
+
+def migrate_schema():
+    cursor.execute("PRAGMA table_info(accounts)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    if "imap_host" not in columns:
+        cursor.execute("ALTER TABLE accounts ADD COLUMN imap_host TEXT")
+    if "imap_port" not in columns:
+        cursor.execute("ALTER TABLE accounts ADD COLUMN imap_port INTEGER")
+
+    conn.commit()
 
 def migrate_encryption():
     cursor.execute("SELECT id, steam_password, email_password, faceit_password FROM accounts")
@@ -336,6 +410,8 @@ class AddAccount(StatesGroup):
     steam_password  = State()
     email           = State()
     email_password  = State()
+    imap_host       = State()
+    imap_port       = State()
     faceit_choice   = State()
     faceit_email    = State()
     faceit_password = State()
@@ -448,8 +524,64 @@ async def add_email(message: types.Message, state: FSMContext):
 @dp.message(StateFilter(AddAccount.email_password))
 async def add_email_pw(message: types.Message, state: FSMContext):
     await state.update_data(email_password=message.text.strip())
-    await state.set_state(AddAccount.faceit_choice)
+    await state.set_state(AddAccount.imap_host)
+    return await message.answer(
+        "IMAP host (example: imap.firstmail.ltd). Send '-' for auto detect.",
+        reply_markup=cancel_kb,
+    )
     await message.answer("Есть Faceit? (да / нет)", reply_markup=cancel_kb)
+
+@dp.message(StateFilter(AddAccount.imap_host))
+async def add_imap_host(message: types.Message, state: FSMContext):
+    raw_value = (message.text or "").strip()
+    lowered = raw_value.lower()
+
+    if lowered in {"-", "auto", "default", "авто"}:
+        await state.update_data(imap_host=None, imap_port=None)
+        await state.set_state(AddAccount.faceit_choice)
+        return await message.answer("Р•СЃС‚СЊ Faceit? (РґР° / РЅРµС‚)", reply_markup=cancel_kb)
+
+    host_part = raw_value
+    port_part = None
+
+    if ":" in raw_value:
+        maybe_host, maybe_port = raw_value.rsplit(":", 1)
+        if maybe_port.isdigit():
+            host_part = maybe_host
+            port_part = int(maybe_port)
+
+    host = _normalize_imap_host(host_part)
+    if not host:
+        return await message.answer(
+            "Enter IMAP host like imap.firstmail.ltd or send '-' for auto detect.",
+            reply_markup=cancel_kb,
+        )
+
+    await state.update_data(imap_host=host)
+    if port_part is not None:
+        await state.update_data(imap_port=port_part)
+        await state.set_state(AddAccount.faceit_choice)
+        return await message.answer("Р•СЃС‚СЊ Faceit? (РґР° / РЅРµС‚)", reply_markup=cancel_kb)
+
+    await state.set_state(AddAccount.imap_port)
+    await message.answer("IMAP port (send '-' for 993):", reply_markup=cancel_kb)
+
+@dp.message(StateFilter(AddAccount.imap_port))
+async def add_imap_port(message: types.Message, state: FSMContext):
+    raw_value = (message.text or "").strip()
+
+    if raw_value in {"", "-"}:
+        port = 993
+    elif raw_value.isdigit():
+        port = int(raw_value)
+        if not (1 <= port <= 65535):
+            return await message.answer("IMAP port must be between 1 and 65535.", reply_markup=cancel_kb)
+    else:
+        return await message.answer("Enter IMAP port as a number or send '-'.", reply_markup=cancel_kb)
+
+    await state.update_data(imap_port=port)
+    await state.set_state(AddAccount.faceit_choice)
+    await message.answer("Р•СЃС‚СЊ Faceit? (РґР° / РЅРµС‚)", reply_markup=cancel_kb)
 
 @dp.message(StateFilter(AddAccount.faceit_choice))
 async def add_faceit_choice(message: types.Message, state: FSMContext):
@@ -476,10 +608,14 @@ async def add_faceit_pw(message: types.Message, state: FSMContext):
 
 async def show_confirm_add(message: types.Message, state: FSMContext):
     d = await state.get_data()
+    imap_host = d.get("imap_host")
+    imap_port = d.get("imap_port")
+    imap_value = f"{imap_host}:{imap_port or 993}" if imap_host else "auto"
     text = (
         f"Подтвердите добавление:\n\n"
         f"Steam: {d['steam_login']} : ********\n"
         f"Email: {d['email']} : ********\n"
+        f"IMAP: {imap_value}\n"
         f"Faceit: {d.get('faceit_email') or 'Нет'}"
     )
     kb = ReplyKeyboardMarkup(
@@ -510,13 +646,15 @@ async def add_confirm(message: types.Message, state: FSMContext):
         cursor.execute("""
             INSERT INTO accounts (
                 steam_login, steam_password, email, email_password,
-                faceit_email, faceit_password, status
-            ) VALUES (?, ?, ?, ?, ?, ?, 'free')
+                imap_host, imap_port, faceit_email, faceit_password, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'free')
         """, (
             login,
             encrypt(d["steam_password"]),
             d["email"],
             encrypt(d["email_password"]),
+            d.get("imap_host"),
+            d.get("imap_port"),
             d.get("faceit_email"),
             encrypt(d.get("faceit_password"))
         ))
@@ -588,7 +726,7 @@ async def show_account_details(message: types.Message, state: FSMContext):
 
     cursor.execute(
         """
-        SELECT steam_login, steam_password, email, email_password, faceit_email, faceit_password, status, rent_end
+        SELECT steam_login, steam_password, email, email_password, imap_host, imap_port, faceit_email, faceit_password, status, rent_end
           FROM accounts
          WHERE id = ?
         """,
@@ -599,7 +737,7 @@ async def show_account_details(message: types.Message, state: FSMContext):
         await state.clear()
         return await message.answer("Ошибка: аккаунт не найден в базе.", reply_markup=main_menu)
 
-    s_login, s_pw_enc, email, e_pw_enc, f_email, f_pw_enc, st, rent_end = row
+    s_login, s_pw_enc, email, e_pw_enc, imap_host, imap_port, f_email, f_pw_enc, st, rent_end = row
     s_pw = decrypt(s_pw_enc)
     e_pw = decrypt(e_pw_enc)
     f_pw = decrypt(f_pw_enc) if f_pw_enc is not None else None
@@ -616,6 +754,8 @@ async def show_account_details(message: types.Message, state: FSMContext):
         f"  Адрес: {email or '-'}",
         f"  Пароль: {e_pw or '-'}",
     ]
+
+    details_lines.append(f"  IMAP: {(f'{imap_host}:{imap_port or 993}') if imap_host else 'auto'}")
 
     if f_email:
         details_lines.extend([
@@ -730,7 +870,7 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
             # Отправляем администратору только Steam логин/пароль для покупателя
             cursor.execute(
                 """
-                SELECT steam_login, steam_password, email, email_password
+                SELECT steam_login, steam_password, email, email_password, imap_host, imap_port
                   FROM accounts
                  WHERE id = ?
                 """,
@@ -738,7 +878,7 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
             )
             row = cursor.fetchone()
             if row:
-                s_login, s_pw_enc, email, e_pw_enc = row
+                s_login, s_pw_enc, email, e_pw_enc, imap_host, imap_port = row
                 s_pw = decrypt(s_pw_enc)
                 e_pw = decrypt(e_pw_enc)
 
@@ -761,6 +901,8 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
                         codes = await wait_for_email_codes(
                             email_address=email,
                             email_password=e_pw,
+                            imap_host=imap_host,
+                            imap_port=imap_port,
                             timeout_s=10 * 60,
                             interval_s=20,
                         )
@@ -948,6 +1090,7 @@ async def checker_loop():
 # ────────────────────────────────────────────────
 
 async def main():
+    migrate_schema()
     migrate_encryption()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     asyncio.create_task(checker_loop())
