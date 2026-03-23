@@ -159,6 +159,10 @@ class FreeAccount(StatesGroup):
 class AccountDetails(StatesGroup):
     select_account = State()
 
+class DeleteAccount(StatesGroup):
+    select_account = State()
+    confirm = State()
+
 # ────────────────────────────────────────────────
 #  Бот и клавиатуры
 # ────────────────────────────────────────────────
@@ -174,8 +178,9 @@ cancel_kb = ReplyKeyboardMarkup(
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Статус"),     KeyboardButton(text="📦 Аккаунты")],
-        [KeyboardButton(text="➕ Добавить"),    KeyboardButton(text="🎮 Сдать")],
-        [KeyboardButton(text="⏱ Продлить"),    KeyboardButton(text="✅ Освободить")]
+        [KeyboardButton(text="➕ Добавить"),    KeyboardButton(text="🗑 Удалить")],
+        [KeyboardButton(text="🎮 Сдать"),       KeyboardButton(text="✅ Освободить")],
+        [KeyboardButton(text="⏱ Продлить")]
     ],
     resize_keyboard=True
 )
@@ -440,6 +445,80 @@ async def show_account_details(message: types.Message, state: FSMContext):
 
     await state.clear()
     await message.answer("\n".join(details_lines), reply_markup=main_menu)
+
+# ────────────────────────────────────────────────
+#  Удаление аккаунта
+# ────────────────────────────────────────────────
+
+@dp.message(F.text == "🗑 Удалить")
+async def delete_start(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    clean_invalid_dates()
+
+    cursor.execute("SELECT id, steam_login, status FROM accounts ORDER BY steam_login")
+    rows = cursor.fetchall()
+    if not rows:
+        return await message.answer("Нет аккаунтов для удаления", reply_markup=main_menu)
+
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=login)] for _, login, _ in rows] + [[KeyboardButton(text="Отмена")]],
+        resize_keyboard=True
+    )
+    await state.set_state(DeleteAccount.select_account)
+    await state.update_data(accounts=rows)
+    await message.answer("Выберите аккаунт для удаления:", reply_markup=kb)
+
+@dp.message(StateFilter(DeleteAccount.select_account))
+async def delete_select_account(message: types.Message, state: FSMContext):
+    login = (message.text or "").strip()
+    data = await state.get_data()
+    row = next((item for item in data.get("accounts", []) if item[1] == login), None)
+
+    if row is None:
+        return await message.answer("Аккаунт не найден в списке", reply_markup=main_menu)
+
+    aid, selected_login, status = row
+    confirm_kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Удалить аккаунт")],
+            [KeyboardButton(text="Отмена")]
+        ],
+        resize_keyboard=True
+    )
+
+    await state.update_data(selected_id=aid, selected_login=selected_login, selected_status=status)
+    await state.set_state(DeleteAccount.confirm)
+    await message.answer(
+        f"Вы выбрали аккаунт: {selected_login}\n"
+        f"Текущий статус: {status}\n\n"
+        "Подтвердите удаление. Это действие необратимо.",
+        reply_markup=confirm_kb
+    )
+
+@dp.message(StateFilter(DeleteAccount.confirm))
+async def delete_confirm(message: types.Message, state: FSMContext):
+    if (message.text or "").strip().lower() != "удалить аккаунт":
+        await state.clear()
+        return await message.answer("Удаление отменено.", reply_markup=main_menu)
+
+    data = await state.get_data()
+    aid = data.get("selected_id")
+    login = data.get("selected_login")
+
+    try:
+        cursor.execute("DELETE FROM accounts WHERE id = ?", (aid,))
+        if cursor.rowcount == 0:
+            conn.rollback()
+            await message.answer("Аккаунт уже удалён или не найден.", reply_markup=main_menu)
+        else:
+            conn.commit()
+            await message.answer(f"Аккаунт {login} удалён.", reply_markup=main_menu)
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"delete error: {e}")
+        await message.answer("Ошибка при удалении аккаунта.", reply_markup=main_menu)
+
+    await state.clear()
 
 # ────────────────────────────────────────────────
 #  Статус
