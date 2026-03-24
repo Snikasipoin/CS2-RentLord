@@ -827,10 +827,10 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
 
     code_action_kb = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="Request Steam Code")],
-            [KeyboardButton(text="Code entered manually")],
-            [KeyboardButton(text="Get Faceit Code")],
-            [KeyboardButton(text="Cancel")]
+            [KeyboardButton(text="Запросить код Steam")],
+            [KeyboardButton(text="Код, введенный вручную")],
+            [KeyboardButton(text="Получить код Faceit")],
+            [KeyboardButton(text="Отменить")]
         ],
         resize_keyboard=True
     )
