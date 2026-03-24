@@ -152,3 +152,222 @@ Get Faceit Code
 Проект построен по service-based архитектуре.
 
 Структура:
+bot/
+
+handlers/
+rent_handlers.py
+account_handlers.py
+
+services/
+steam_guard_service.py
+faceit_service.py
+imap_service.py
+
+database/
+models.py
+db.py
+
+scheduler/
+rent_scheduler.py
+
+utils/
+crypto.py
+helpers.py
+
+bot.py
+config.py
+
+
+---
+
+# Технический стек
+
+Python 3.10+
+
+aiogram v3
+
+SQLite
+
+Asyncio
+
+IMAP automation
+
+FSM state machine
+
+Service architecture
+
+---
+
+# Workflow аренды
+
+Стандартный поток:
+
+FREE  
+→ WAITING CODE  
+→ RENTED  
+
+или:
+
+FREE  
+→ RENTED (manual)
+
+Это предотвращает:
+
+• двойную аренду  
+• ошибки  
+• race conditions  
+
+---
+
+# Безопасность
+
+Проект учитывает безопасность:
+
+• Email пароли шифруются  
+• Нет утечек в логах  
+• Асинхронные подключения  
+• Таймауты  
+• Контроль ошибок  
+• Нет хранения кодов  
+
+---
+
+# Производительность
+
+Бот рассчитан на:
+
+10–200 аккаунтов без проблем.
+
+При оптимизации:
+
+500+ аккаунтов.
+
+За счет:
+
+Async IMAP  
+Non blocking handlers  
+FSM логики  
+
+---
+
+# Установка
+
+Клонировать проект:
+
+
+git clone https://github.com/yourname/cs2-rent-bot
+
+
+Перейти в папку:
+
+
+cd cs2-rent-bot
+
+
+Установить зависимости:
+
+
+pip install -r requirements.txt
+
+
+Создать .env:
+
+
+BOT_TOKEN=
+ADMIN_ID=
+
+
+Запустить:
+
+
+python bot.py
+
+
+---
+
+# Настройка аккаунтов
+
+Пример:
+
+
+Steam login: login
+Steam password: password
+
+Email: email@example.com
+
+Email password: emailpass
+
+
+IMAP должен быть включен.
+
+---
+
+# Roadmap (V2)
+
+Планируемые улучшения:
+
+• Multi admin system  
+• Web панель  
+• Статистика доходности  
+• Группы аккаунтов  
+• Auto rent extension  
+• Mail connection pool  
+• Faceit auto detect  
+• Account tags  
+• Profit analytics  
+
+---
+
+# Возможные улучшения V3
+
+• Redis кеш  
+• PostgreSQL  
+• Web dashboard  
+• REST API  
+• Docker deployment  
+• Horizontal scaling  
+
+---
+
+# Философия проекта
+
+Проект создавался с принципами:
+
+Automation first  
+Clean architecture  
+No spaghetti code  
+Production mindset  
+Scalability ready  
+
+---
+
+# Для кого проект
+
+Подойдет если:
+
+Вы сдаете Steam аккаунты  
+У вас много аккаунтов  
+Вы устали от ручного контроля  
+Хотите автоматизацию  
+
+---
+
+# Disclaimer
+
+Этот проект является инструментом автоматизации.
+
+Пользователь несет ответственность за соблюдение правил Steam, Faceit и других сервисов.
+
+---
+
+# Автор
+
+Private automation project.
+
+---
+
+# License
+
+MIT License
+
+Можно свободно изменять и дорабатывать.
