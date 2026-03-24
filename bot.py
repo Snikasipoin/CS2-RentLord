@@ -27,6 +27,7 @@ load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_RAW = os.getenv("ADMIN_ID") or ""
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
+SHARED_DIR = os.getenv("SHARED_DIR") or ("/app/shared" if os.name != "nt" else "")
 
 def _parse_admin_ids(raw: str) -> list[int]:
     # Поддержка формата:
@@ -100,7 +101,16 @@ def decrypt(encrypted: str | None) -> str | None:
 #  База данных
 # ────────────────────────────────────────────────
 
-conn = sqlite3.connect("accounts.db", check_same_thread=False)
+DB_PATH = "accounts.db"
+if SHARED_DIR:
+    try:
+        os.makedirs(SHARED_DIR, exist_ok=True)
+        if os.path.isdir(SHARED_DIR):
+            DB_PATH = os.path.join(SHARED_DIR, "accounts.db")
+    except Exception as e:
+        logging.warning(f"shared storage unavailable: {e}")
+
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -920,7 +930,7 @@ async def rent_waiting_code_action(message: types.Message, state: FSMContext):
 
         cursor.execute(
             """
-            SELECT steam_login, steam_password
+            SELECT steam_login, steam_password, faceit_email, faceit_password
               FROM accounts
              WHERE id = ?
             """,
@@ -928,12 +938,25 @@ async def rent_waiting_code_action(message: types.Message, state: FSMContext):
         )
         row = cursor.fetchone()
         if row:
-            s_login, s_pw_enc = row
+            s_login, s_pw_enc, f_email, f_pw_enc = row
             s_pw = decrypt(s_pw_enc)
+            f_pw = decrypt(f_pw_enc) if f_pw_enc else None
+
+            buyer_lines = [
+                "Данные для покупателя:",
+                f"Steam логин: {s_login}",
+                f"Steam пароль: {s_pw}",
+            ]
+            if f_email and f_pw:
+                buyer_lines.extend([
+                    "",
+                    "Faceit:",
+                    f"Email: {f_email}",
+                    f"Пароль: {f_pw}",
+                ])
+
             await message.answer(
-                "Данные для покупателя:\n"
-                f"Steam логин: {s_login}\n"
-                f"Steam пароль: {s_pw}"
+                "\n".join(buyer_lines)
             )
         return True
 
@@ -1151,5 +1174,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
