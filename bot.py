@@ -2,12 +2,7 @@
 import sqlite3
 import logging
 import os
-import re
-import time
-import imaplib
 from datetime import datetime, timedelta
-from email import message_from_bytes
-from email.header import decode_header
 
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet, InvalidToken
@@ -27,7 +22,6 @@ load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_RAW = os.getenv("ADMIN_ID") or ""
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
-SHARED_DIR = os.getenv("SHARED_DIR") or ("/app/shared" if os.name != "nt" else "")
 
 def _parse_admin_ids(raw: str) -> list[int]:
     # Поддержка формата:
@@ -101,16 +95,7 @@ def decrypt(encrypted: str | None) -> str | None:
 #  База данных
 # ────────────────────────────────────────────────
 
-DB_PATH = "accounts.db"
-if SHARED_DIR:
-    try:
-        os.makedirs(SHARED_DIR, exist_ok=True)
-        if os.path.isdir(SHARED_DIR):
-            DB_PATH = os.path.join(SHARED_DIR, "accounts.db")
-    except Exception as e:
-        logging.warning(f"shared storage unavailable: {e}")
-
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+conn = sqlite3.connect("accounts.db", check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -163,7 +148,6 @@ class AddAccount(StatesGroup):
 class RentAccount(StatesGroup):
     select_account = State()
     select_time    = State()
-    waiting_code_action = State()
 
 class ExtendAccount(StatesGroup):
     select_account = State()
@@ -174,10 +158,6 @@ class FreeAccount(StatesGroup):
 
 class AccountDetails(StatesGroup):
     select_account = State()
-
-class DeleteAccount(StatesGroup):
-    select_account = State()
-    confirm = State()
 
 # ────────────────────────────────────────────────
 #  Бот и клавиатуры
@@ -194,9 +174,8 @@ cancel_kb = ReplyKeyboardMarkup(
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Статус"),     KeyboardButton(text="📦 Аккаунты")],
-        [KeyboardButton(text="➕ Добавить"),    KeyboardButton(text="🗑 Удалить")],
-        [KeyboardButton(text="🎮 Сдать"),       KeyboardButton(text="✅ Освободить")],
-        [KeyboardButton(text="⏱ Продлить")]
+        [KeyboardButton(text="➕ Добавить"),    KeyboardButton(text="🎮 Сдать")],
+        [KeyboardButton(text="⏱ Продлить"),    KeyboardButton(text="✅ Освободить")]
     ],
     resize_keyboard=True
 )
@@ -217,234 +196,6 @@ def clean_invalid_dates():
         conn.commit()
     except Exception as e:
         logging.error(f"clean_invalid_dates error: {e}")
-
-def _detect_imap_hosts(email_address: str) -> list[tuple[str, int]]:
-    email_address = (email_address or "").lower().strip()
-    if email_address.endswith("@gmail.com"):
-        return [("imap.gmail.com", 993)]
-    if email_address.endswith("@proton.me") or email_address.endswith("@protonmail.com") or email_address.endswith("@pm.me"):
-        return [("imap.proton.me", 993), ("imap.protonmail.com", 993)]
-    return []
-
-def _normalize_imap_host(host: str | None) -> str | None:
-    host = (host or "").strip().lower()
-    if not host:
-        return None
-    if host.startswith("imap://"):
-        host = host[7:]
-    if host.startswith("imaps://"):
-        host = host[8:]
-    return host.strip("/")
-
-def _build_imap_hosts(email_address: str) -> list[tuple[str, int]]:
-    candidates: list[tuple[str, int]] = []
-    seen: set[tuple[str, int]] = set()
-
-    def add_candidate(host: str | None, port: int = 993):
-        normalized_host = _normalize_imap_host(host)
-        if not normalized_host:
-            return
-        item = (normalized_host, port)
-        if item not in seen:
-            seen.add(item)
-            candidates.append(item)
-
-    for host, port in _detect_imap_hosts(email_address):
-        add_candidate(host, port)
-
-    if "@" in (email_address or ""):
-        domain = email_address.rsplit("@", 1)[1].strip().lower()
-        for guessed_host in (f"imap.{domain}", f"mail.{domain}", domain):
-            add_candidate(guessed_host, 993)
-
-    return candidates
-
-def _decode_mime_words(value: str | None) -> str:
-    if not value:
-        return ""
-
-    parts: list[str] = []
-    for part, encoding in decode_header(value):
-        if isinstance(part, bytes):
-            try:
-                parts.append(part.decode(encoding or "utf-8", errors="replace"))
-            except Exception:
-                parts.append(part.decode("utf-8", errors="replace"))
-        else:
-            parts.append(str(part))
-    return "".join(parts)
-
-def _extract_text_from_email_bytes(raw: bytes) -> tuple[str, str, str]:
-    msg = message_from_bytes(raw)
-    subject = _decode_mime_words(msg.get("Subject"))
-    from_ = _decode_mime_words(msg.get("From"))
-
-    parts_text: list[str] = []
-    if msg.is_multipart():
-        for part in msg.walk():
-            ctype = (part.get_content_type() or "").lower()
-            if ctype not in ("text/plain", "text/html"):
-                continue
-            payload = part.get_payload(decode=True)
-            if payload is None:
-                continue
-            charset = part.get_content_charset() or "utf-8"
-            try:
-                text = payload.decode(charset, errors="replace")
-            except Exception:
-                text = payload.decode("utf-8", errors="replace")
-            if ctype == "text/html":
-                text = re.sub(r"<[^>]+>", " ", text)
-            parts_text.append(text)
-    else:
-        payload = msg.get_payload(decode=True)
-        if payload:
-            charset = msg.get_content_charset() or "utf-8"
-            try:
-                parts_text.append(payload.decode(charset, errors="replace"))
-            except Exception:
-                parts_text.append(payload.decode("utf-8", errors="replace"))
-
-    return subject, from_, "\n".join(parts_text).strip()
-
-def _search_unseen_message_ids(imap: imaplib.IMAP4_SSL, senders: tuple[str, ...]) -> list[bytes]:
-    found: list[bytes] = []
-    seen: set[bytes] = set()
-
-    for sender in senders:
-        typ, data = imap.uid("search", None, f'(UNSEEN FROM "{sender}")')
-        if typ != "OK" or not data:
-            continue
-        for uid in (data[0] or b"").split():
-            if uid not in seen:
-                seen.add(uid)
-                found.append(uid)
-
-    return found
-
-def _get_email_code_sync(
-    email_address: str,
-    email_password: str,
-    senders: tuple[str, ...],
-    pattern: str,
-    timeout_s: int = 120,
-    interval_s: int = 5,
-) -> str | None:
-    hosts = _build_imap_hosts(email_address)
-    if not hosts:
-        raise RuntimeError(f"Unknown IMAP host for email: {email_address}")
-
-    deadline = time.monotonic() + timeout_s
-    last_error: Exception | None = None
-
-    for host, port in hosts:
-        imap = None
-        try:
-            imap = imaplib.IMAP4_SSL(host, port)
-            imap.login(email_address, email_password)
-            imap.select("INBOX")
-
-            baseline = set(_search_unseen_message_ids(imap, senders))
-            while time.monotonic() < deadline:
-                current_ids = _search_unseen_message_ids(imap, senders)
-                new_ids = [uid for uid in current_ids if uid not in baseline]
-
-                for uid in reversed(new_ids):
-                    typ, msg_data = imap.uid("fetch", uid.decode(), "(RFC822)")
-                    if typ != "OK" or not msg_data:
-                        continue
-
-                    raw = None
-                    for part in msg_data:
-                        if isinstance(part, tuple) and len(part) >= 2:
-                            raw = part[1]
-                            break
-                    if not raw:
-                        continue
-
-                    subject, from_, body_text = _extract_text_from_email_bytes(raw)
-                    haystack = f"{subject}\n{from_}\n{body_text}".upper()
-                    match = re.search(pattern, haystack)
-                    if match:
-                        try:
-                            imap.uid("store", uid.decode(), "+FLAGS", "\\Seen")
-                        except Exception:
-                            pass
-                        return match.group(1)
-
-                baseline.update(current_ids)
-                time.sleep(interval_s)
-
-            return None
-        except Exception as e:
-            last_error = e
-        finally:
-            if imap is not None:
-                try:
-                    imap.logout()
-                except Exception:
-                    pass
-
-    raise RuntimeError(f"IMAP error: {last_error}")
-
-async def get_steam_guard_code(email: str, password: str) -> str | None:
-    return await asyncio.to_thread(
-        _get_email_code_sync,
-        email,
-        password,
-        ("noreply@steampowered.com", "no-reply@steampowered.com"),
-        r"\b([A-Z0-9]{5})\b",
-        120,
-        5,
-    )
-
-async def check_steam_code(account_id: int) -> str | None:
-    cursor.execute(
-        """
-        SELECT email, email_password
-          FROM accounts
-         WHERE id = ?
-        """,
-        (account_id,)
-    )
-    row = cursor.fetchone()
-    if not row:
-        raise RuntimeError("Account not found")
-
-    email, email_password_enc = row
-    email_password = decrypt(email_password_enc)
-    if not email or not email_password or email_password.startswith("[ошибка"):
-        raise RuntimeError("Email check failed")
-
-    return await get_steam_guard_code(email, email_password)
-
-async def check_faceit_code(account_id: int) -> str | None:
-    cursor.execute(
-        """
-        SELECT email, email_password
-          FROM accounts
-         WHERE id = ?
-        """,
-        (account_id,)
-    )
-    row = cursor.fetchone()
-    if not row:
-        raise RuntimeError("Account not found")
-
-    email, email_password_enc = row
-    email_password = decrypt(email_password_enc)
-    if not email or not email_password or email_password.startswith("[ошибка"):
-        raise RuntimeError("Email check failed")
-
-    return await asyncio.to_thread(
-        _get_email_code_sync,
-        email,
-        email_password,
-        ("notifications@faceit.com",),
-        r"\b(\d{6})\b",
-        120,
-        5,
-    )
 
 # ────────────────────────────────────────────────
 #  Отмена любого состояния
@@ -691,80 +442,6 @@ async def show_account_details(message: types.Message, state: FSMContext):
     await message.answer("\n".join(details_lines), reply_markup=main_menu)
 
 # ────────────────────────────────────────────────
-#  Удаление аккаунта
-# ────────────────────────────────────────────────
-
-@dp.message(F.text == "🗑 Удалить")
-async def delete_start(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS: return
-    clean_invalid_dates()
-
-    cursor.execute("SELECT id, steam_login, status FROM accounts ORDER BY steam_login")
-    rows = cursor.fetchall()
-    if not rows:
-        return await message.answer("Нет аккаунтов для удаления", reply_markup=main_menu)
-
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=login)] for _, login, _ in rows] + [[KeyboardButton(text="Отмена")]],
-        resize_keyboard=True
-    )
-    await state.set_state(DeleteAccount.select_account)
-    await state.update_data(accounts=rows)
-    await message.answer("Выберите аккаунт для удаления:", reply_markup=kb)
-
-@dp.message(StateFilter(DeleteAccount.select_account))
-async def delete_select_account(message: types.Message, state: FSMContext):
-    login = (message.text or "").strip()
-    data = await state.get_data()
-    row = next((item for item in data.get("accounts", []) if item[1] == login), None)
-
-    if row is None:
-        return await message.answer("Аккаунт не найден в списке", reply_markup=main_menu)
-
-    aid, selected_login, status = row
-    confirm_kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Удалить аккаунт")],
-            [KeyboardButton(text="Отмена")]
-        ],
-        resize_keyboard=True
-    )
-
-    await state.update_data(selected_id=aid, selected_login=selected_login, selected_status=status)
-    await state.set_state(DeleteAccount.confirm)
-    await message.answer(
-        f"Вы выбрали аккаунт: {selected_login}\n"
-        f"Текущий статус: {status}\n\n"
-        "Подтвердите удаление. Это действие необратимо.",
-        reply_markup=confirm_kb
-    )
-
-@dp.message(StateFilter(DeleteAccount.confirm))
-async def delete_confirm(message: types.Message, state: FSMContext):
-    if (message.text or "").strip().lower() != "удалить аккаунт":
-        await state.clear()
-        return await message.answer("Удаление отменено.", reply_markup=main_menu)
-
-    data = await state.get_data()
-    aid = data.get("selected_id")
-    login = data.get("selected_login")
-
-    try:
-        cursor.execute("DELETE FROM accounts WHERE id = ?", (aid,))
-        if cursor.rowcount == 0:
-            conn.rollback()
-            await message.answer("Аккаунт уже удалён или не найден.", reply_markup=main_menu)
-        else:
-            conn.commit()
-            await message.answer(f"Аккаунт {login} удалён.", reply_markup=main_menu)
-    except Exception as e:
-        conn.rollback()
-        logging.error(f"delete error: {e}")
-        await message.answer("Ошибка при удалении аккаунта.", reply_markup=main_menu)
-
-    await state.clear()
-
-# ────────────────────────────────────────────────
 #  Статус
 # ────────────────────────────────────────────────
 
@@ -833,21 +510,6 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
         return await message.answer("Выберите время из списка", reply_markup=main_menu)
 
     hours = int(txt.split()[0])
-    await state.update_data(selected_hours=hours)
-
-    code_action_kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Запросить код Steam")],
-            [KeyboardButton(text="Код, введенный вручную")],
-            [KeyboardButton(text="Получить код Faceit")],
-            [KeyboardButton(text="Отменить")]
-        ],
-        resize_keyboard=True
-    )
-    await state.set_state(RentAccount.waiting_code_action)
-    await message.answer("Выберите действие с кодом:", reply_markup=code_action_kb)
-    return
-
     data = await state.get_data()
     aid = data["selected_id"]
     login = data["selected_login"]
@@ -898,114 +560,6 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
 # ────────────────────────────────────────────────
 #  Освобождение
 # ────────────────────────────────────────────────
-
-@dp.message(StateFilter(RentAccount.waiting_code_action))
-async def rent_waiting_code_action(message: types.Message, state: FSMContext):
-    txt = (message.text or "").strip().lower()
-    if txt in ("cancel", "отмена"):
-        await state.clear()
-        return await message.answer("Сдача отменена", reply_markup=main_menu)
-
-    data = await state.get_data()
-    aid = data["selected_id"]
-    login = data["selected_login"]
-    hours = data["selected_hours"]
-    end = datetime.now() + timedelta(hours=hours)
-
-    async def complete_rent() -> bool:
-        cursor.execute(
-            "UPDATE accounts SET status='busy', rent_end=? WHERE id=? AND status='free'",
-            (end.isoformat(), aid)
-        )
-        if cursor.rowcount == 0:
-            conn.rollback()
-            await message.answer("Аккаунт уже занят или удалён", reply_markup=main_menu)
-            return False
-
-        conn.commit()
-        await message.answer(
-            f"Аккаунт **{login}** сдан до {end.strftime('%d.%m %H:%M')}",
-            reply_markup=main_menu
-        )
-
-        cursor.execute(
-            """
-            SELECT steam_login, steam_password, faceit_email, faceit_password
-              FROM accounts
-             WHERE id = ?
-            """,
-            (aid,)
-        )
-        row = cursor.fetchone()
-        if row:
-            s_login, s_pw_enc, f_email, f_pw_enc = row
-            s_pw = decrypt(s_pw_enc)
-            f_pw = decrypt(f_pw_enc) if f_pw_enc else None
-
-            buyer_lines = [
-                "Данные для покупателя:",
-                f"Steam логин: {s_login}",
-                f"Steam пароль: {s_pw}",
-            ]
-            if f_email and f_pw:
-                buyer_lines.extend([
-                    "",
-                    "Faceit:",
-                    f"Email: {f_email}",
-                    f"Пароль: {f_pw}",
-                ])
-
-            await message.answer(
-                "\n".join(buyer_lines)
-            )
-        return True
-
-    try:
-        if txt == "code entered manually":
-            await complete_rent()
-            await state.clear()
-            return
-
-        if txt == "request steam code":
-            try:
-                code = await check_steam_code(aid)
-            except Exception as e:
-                logging.error(f"steam code check error: {e}")
-                await state.clear()
-                return await message.answer("Email check failed", reply_markup=main_menu)
-
-            if not code:
-                await state.clear()
-                return await message.answer("Steam code not found", reply_markup=main_menu)
-
-            for admin_id in ADMIN_IDS:
-                try:
-                    await bot.send_message(admin_id, f"Steam Guard {login}: {code}")
-                except Exception as e:
-                    logging.error(f"steam code send error: {e}")
-
-            await complete_rent()
-            await state.clear()
-            return
-
-        if txt == "get faceit code":
-            try:
-                code = await check_faceit_code(aid)
-            except Exception as e:
-                logging.error(f"faceit code check error: {e}")
-                return await message.answer("Email check failed")
-
-            if not code:
-                return await message.answer("Faceit code not found")
-
-            return await message.answer(code)
-
-        await message.answer("Выберите действие из списка")
-    except Exception as e:
-        conn.rollback()
-        logging.error(f"rent error: {e}")
-        await state.clear()
-        await message.answer("Ошибка при сдаче", reply_markup=main_menu)
 
 @dp.message(F.text == "✅ Освободить")
 async def free_start(message: types.Message, state: FSMContext):
