@@ -158,6 +158,11 @@ class FreeAccount(StatesGroup):
 
 class AccountDetails(StatesGroup):
     select_account = State()
+    view_action = State()
+
+class EditAccount(StatesGroup):
+    choose_field = State()
+    enter_value = State()
 
 # ────────────────────────────────────────────────
 #  Бот и клавиатуры
@@ -196,6 +201,103 @@ def clean_invalid_dates():
         conn.commit()
     except Exception as e:
         logging.error(f"clean_invalid_dates error: {e}")
+
+
+def get_account_by_id(aid: int):
+    cursor.execute(
+        """
+        SELECT steam_login, steam_password, email, email_password, faceit_email, faceit_password, status, rent_end
+          FROM accounts
+         WHERE id = ?
+        """,
+        (aid,),
+    )
+    return cursor.fetchone()
+
+
+def build_account_details_text(row) -> str:
+    s_login, s_pw_enc, email, e_pw_enc, f_email, f_pw_enc, st, rent_end = row
+    s_pw = decrypt(s_pw_enc)
+    e_pw = decrypt(e_pw_enc)
+    f_pw = decrypt(f_pw_enc) if f_pw_enc is not None else None
+
+    details_lines = [
+        f"Данные аккаунта: {s_login}",
+        f"Статус: {st}",
+        "",
+        "Steam:",
+        f"  Логин: {s_login}",
+        f"  Пароль: {s_pw}",
+        "",
+        "Email:",
+        f"  Адрес: {email or '-'}",
+        f"  Пароль: {e_pw or '-'}",
+    ]
+
+    if f_email or f_pw_enc:
+        details_lines.extend([
+            "",
+            "Faceit:",
+            f"  Email: {f_email or '-'}",
+            f"  Пароль: {f_pw or '-'}",
+        ])
+
+    if st == "busy" and rent_end:
+        try:
+            dt = datetime.fromisoformat(rent_end)
+            mins = max(0, int((dt - datetime.now()).total_seconds() / 60))
+            details_lines.extend(["", f"До конца аренды: ~{mins} мин"])
+        except Exception:
+            pass
+
+    return "\n".join(details_lines)
+
+
+def detail_actions_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Редактировать")],
+            [KeyboardButton(text="Назад")],
+        ],
+        resize_keyboard=True
+    )
+
+
+def edit_fields_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Steam логин"), KeyboardButton(text="Steam пароль")],
+            [KeyboardButton(text="Email"), KeyboardButton(text="Пароль email")],
+            [KeyboardButton(text="Faceit email"), KeyboardButton(text="Пароль Faceit")],
+            [KeyboardButton(text="Назад")],
+        ],
+        resize_keyboard=True
+    )
+
+
+def parse_extend_delta(text: str) -> timedelta | None:
+    txt = (text or "").strip().lower().replace("минут", "мин").replace("часов", "час").replace("часа", "час")
+    if txt in {"30 мин", "30 минут", "+30 мин", "+30 минут"}:
+        return timedelta(minutes=30)
+
+    if txt.startswith("+"):
+        txt = txt[1:].strip()
+
+    if " " not in txt:
+        return None
+
+    amount_raw, unit = txt.split(maxsplit=1)
+    if not amount_raw.isdigit():
+        return None
+
+    amount = int(amount_raw)
+    if unit.startswith("мин"):
+        if amount < 30:
+            return None
+        return timedelta(minutes=amount)
+    if unit.startswith("час"):
+        return timedelta(hours=amount)
+    return None
 
 # ────────────────────────────────────────────────
 #  Отмена любого состояния
@@ -345,6 +447,11 @@ async def show_accounts(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
     clean_invalid_dates()
 
+    await render_accounts_list(message, state)
+
+
+async def render_accounts_list(message: types.Message, state: FSMContext):
+    await state.clear()
     cursor.execute("SELECT id, steam_login, status, rent_end FROM accounts ORDER BY steam_login")
     rows = cursor.fetchall()
 
@@ -389,57 +496,132 @@ async def show_account_details(message: types.Message, state: FSMContext):
         return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
 
     aid = chosen["id"]
-
-    cursor.execute(
-        """
-        SELECT steam_login, steam_password, email, email_password, faceit_email, faceit_password, status, rent_end
-          FROM accounts
-         WHERE id = ?
-        """,
-        (aid,),
-    )
-    row = cursor.fetchone()
+    row = get_account_by_id(aid)
     if not row:
         await state.clear()
         return await message.answer("Ошибка: аккаунт не найден в базе.", reply_markup=main_menu)
 
-    s_login, s_pw_enc, email, e_pw_enc, f_email, f_pw_enc, st, rent_end = row
-    s_pw = decrypt(s_pw_enc)
-    e_pw = decrypt(e_pw_enc)
-    f_pw = decrypt(f_pw_enc) if f_pw_enc is not None else None
+    await state.update_data(selected_id=aid, selected_login=login)
+    await state.set_state(AccountDetails.view_action)
+    await message.answer(build_account_details_text(row), reply_markup=detail_actions_kb())
 
-    details_lines = [
-        f"Данные аккаунта: {s_login}",
-        f"Статус: {st}",
-        "",
-        "Steam:",
-        f"  Логин: {s_login}",
-        f"  Пароль: {s_pw}",
-        "",
-        "Email:",
-        f"  Адрес: {email or '-'}",
-        f"  Пароль: {e_pw or '-'}",
-    ]
 
-    if f_email:
-        details_lines.extend([
-            "",
-            "Faceit:",
-            f"  Email: {f_email}",
-            f"  Пароль: {f_pw or '-'}",
-        ])
+@dp.message(StateFilter(AccountDetails.view_action))
+async def account_detail_action(message: types.Message, state: FSMContext):
+    txt = (message.text or "").strip().lower()
+    data = await state.get_data()
+    aid = data.get("selected_id")
 
-    # Пара строк про аренду — удобно, но не обязательно
-    if st == "busy" and rent_end:
-        try:
-            dt = datetime.fromisoformat(rent_end)
-            mins = max(0, int((dt - datetime.now()).total_seconds() / 60))
-            details_lines.extend(["", f"До конца аренды: ~{mins} мин"])
-        except Exception:
-            pass
+    if txt == "назад":
+        await state.clear()
+        return await render_accounts_list(message, state)
 
-    await state.clear()
-    await message.answer("\n".join(details_lines), reply_markup=main_menu)
+    if txt != "редактировать":
+        return await message.answer("Нажмите «Редактировать» или «Назад».", reply_markup=detail_actions_kb())
+
+    if not aid:
+        await state.clear()
+        return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+    await state.set_state(EditAccount.choose_field)
+    await message.answer("Что изменить?", reply_markup=edit_fields_kb())
+
+
+@dp.message(StateFilter(EditAccount.choose_field))
+async def edit_choose_field(message: types.Message, state: FSMContext):
+    txt = (message.text or "").strip().lower()
+    if txt == "назад":
+        data = await state.get_data()
+        aid = data.get("selected_id")
+        if not aid:
+            await state.clear()
+            return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+        row = get_account_by_id(aid)
+        if not row:
+            await state.clear()
+            return await message.answer("Ошибка: аккаунт не найден в базе.", reply_markup=main_menu)
+
+        await state.set_state(AccountDetails.view_action)
+        return await message.answer(build_account_details_text(row), reply_markup=detail_actions_kb())
+
+    field_map = {
+        "steam логин": ("steam_login", "Steam логин", False),
+        "steam пароль": ("steam_password", "Steam пароль", False),
+        "email": ("email", "Email", True),
+        "пароль email": ("email_password", "Пароль email", True),
+        "faceit email": ("faceit_email", "Faceit email", True),
+        "пароль faceit": ("faceit_password", "Пароль Faceit", True),
+    }
+    field = field_map.get(txt)
+    if field is None:
+        return await message.answer("Выберите поле из списка.", reply_markup=edit_fields_kb())
+
+    field_name, label, can_clear = field
+    await state.update_data(edit_field=field_name, edit_label=label, edit_can_clear=can_clear)
+    await state.set_state(EditAccount.enter_value)
+    await message.answer(
+        f"Введите новое значение для «{label}».\n"
+        + ("Для очистки можно отправить «-»." if can_clear else ""),
+        reply_markup=cancel_kb
+    )
+
+
+@dp.message(StateFilter(EditAccount.enter_value))
+async def edit_enter_value(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    aid = data.get("selected_id")
+    field = data.get("edit_field")
+    label = data.get("edit_label", "поле")
+    can_clear = bool(data.get("edit_can_clear"))
+    value = (message.text or "").strip()
+
+    if not aid or not field:
+        await state.clear()
+        return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+    if value.lower() == "отмена":
+        await state.clear()
+        return await message.answer("Редактирование отменено.", reply_markup=main_menu)
+
+    if can_clear and value in {"-", "нет", "пусто", "none"}:
+        new_value = None
+    else:
+        if not value:
+            return await message.answer("Значение не может быть пустым.", reply_markup=cancel_kb)
+        new_value = value
+
+    if field == "steam_login":
+        cursor.execute("SELECT 1 FROM accounts WHERE steam_login = ? AND id <> ?", (new_value, aid))
+        if cursor.fetchone():
+            return await message.answer("Такой Steam логин уже существует.", reply_markup=cancel_kb)
+
+    stored_value = encrypt(new_value) if field in {"steam_password", "email_password", "faceit_password"} and new_value is not None else new_value
+
+    try:
+        cursor.execute(f"UPDATE accounts SET {field} = ? WHERE id = ?", (stored_value, aid))
+        if cursor.rowcount == 0:
+            conn.rollback()
+            await state.clear()
+            return await message.answer("Аккаунт не найден или уже удалён.", reply_markup=main_menu)
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return await message.answer("Не удалось сохранить изменения: проверьте уникальность логина.", reply_markup=cancel_kb)
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"edit error: {e}")
+        return await message.answer("Ошибка сохранения изменений.", reply_markup=cancel_kb)
+
+    row = get_account_by_id(aid)
+    if not row:
+        await state.clear()
+        return await message.answer("Аккаунт обновлён, но не найден для повторного просмотра.", reply_markup=main_menu)
+
+    await state.update_data(selected_login=row[0])
+    await state.set_state(AccountDetails.view_action)
+    await message.answer(f"Поле «{label}» обновлено.", reply_markup=detail_actions_kb())
+    await message.answer(build_account_details_text(row), reply_markup=detail_actions_kb())
 
 # ────────────────────────────────────────────────
 #  Статус
@@ -490,14 +672,15 @@ async def rent_select_account(message: types.Message, state: FSMContext):
 
     times_kb = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="1 час"), KeyboardButton(text="2 часа"), KeyboardButton(text="3 часа")],
-            [KeyboardButton(text="6 часов"), KeyboardButton(text="12 часов"), KeyboardButton(text="24 часа")],
+            [KeyboardButton(text="30 минут"), KeyboardButton(text="1 час"), KeyboardButton(text="2 часа")],
+            [KeyboardButton(text="3 часа"), KeyboardButton(text="6 часов"), KeyboardButton(text="12 часов")],
+            [KeyboardButton(text="24 часа")],
             [KeyboardButton(text="Отмена")]
         ],
         resize_keyboard=True
     )
     await state.set_state(RentAccount.select_time)
-    await message.answer("На сколько часов?", reply_markup=times_kb)
+    await message.answer("На сколько времени?", reply_markup=times_kb)
 
 @dp.message(StateFilter(RentAccount.select_time))
 async def rent_confirm_time(message: types.Message, state: FSMContext):
@@ -506,15 +689,15 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
         await state.clear()
         return await message.answer("Сдача отменена", reply_markup=main_menu)
 
-    if not any(txt.startswith(str(h)) for h in (1,2,3,6,12,24)):
+    delta = parse_extend_delta(txt)
+    if delta is None:
         return await message.answer("Выберите время из списка", reply_markup=main_menu)
 
-    hours = int(txt.split()[0])
     data = await state.get_data()
     aid = data["selected_id"]
     login = data["selected_login"]
 
-    end = datetime.now() + timedelta(hours=hours)
+    end = datetime.now() + delta
 
     try:
         cursor.execute(
@@ -531,10 +714,9 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
                 reply_markup=main_menu
             )
 
-            # Отправляем администратору только Steam логин/пароль для покупателя
             cursor.execute(
                 """
-                SELECT steam_login, steam_password
+                SELECT steam_login, steam_password, faceit_email, faceit_password
                   FROM accounts
                  WHERE id = ?
                 """,
@@ -542,13 +724,20 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
             )
             row = cursor.fetchone()
             if row:
-                s_login, s_pw_enc = row
+                s_login, s_pw_enc, f_email, f_pw_enc = row
                 s_pw = decrypt(s_pw_enc)
+                faceit_text = ""
+                if f_email or f_pw_enc:
+                    faceit_text = (
+                        f"\nFaceit email: {f_email or '-'}"
+                        f"\nFaceit пароль: {decrypt(f_pw_enc) if f_pw_enc else '-'}"
+                    )
 
                 await message.answer(
                     "Данные для покупателя:\n"
                     f"Steam логин: {s_login}\n"
                     f"Steam пароль: {s_pw}"
+                    f"{faceit_text}"
                 )
     except Exception as e:
         conn.rollback()
@@ -635,8 +824,9 @@ async def extend_select(message: types.Message, state: FSMContext):
 
     times_kb = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="+1 час"), KeyboardButton(text="+2 часа"), KeyboardButton(text="+3 часа")],
-            [KeyboardButton(text="+6 часов"), KeyboardButton(text="+12 часов"), KeyboardButton(text="+24 часа")],
+            [KeyboardButton(text="30 минут"), KeyboardButton(text="+1 час"), KeyboardButton(text="+2 часа")],
+            [KeyboardButton(text="+3 часа"), KeyboardButton(text="+6 часов"), KeyboardButton(text="+12 часов")],
+            [KeyboardButton(text="+24 часа")],
             [KeyboardButton(text="Отмена")]
         ],
         resize_keyboard=True
@@ -651,10 +841,10 @@ async def extend_confirm(message: types.Message, state: FSMContext):
         await state.clear()
         return await message.answer("Продление отменено", reply_markup=main_menu)
 
-    if not txt.startswith("+") or not any(txt[1:].startswith(str(h)) for h in (1,2,3,6,12,24)):
+    delta = parse_extend_delta(txt)
+    if delta is None or delta < timedelta(minutes=30):
         return await message.answer("Выберите время из списка", reply_markup=main_menu)
 
-    hours = int(txt[1:].split()[0])
     data = await state.get_data()
     aid = data["selected_id"]
     login = data["selected_login"]
@@ -665,7 +855,7 @@ async def extend_confirm(message: types.Message, state: FSMContext):
     except:
         cur_end = datetime.now()
 
-    new_end = cur_end + timedelta(hours=hours)
+    new_end = cur_end + delta
 
     try:
         cursor.execute(
