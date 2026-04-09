@@ -164,6 +164,9 @@ class EditAccount(StatesGroup):
     choose_field = State()
     enter_value = State()
 
+class DeleteAccount(StatesGroup):
+    confirm = State()
+
 # ────────────────────────────────────────────────
 #  Бот и клавиатуры
 # ────────────────────────────────────────────────
@@ -256,8 +259,18 @@ def build_account_details_text(row) -> str:
 def detail_actions_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="Редактировать")],
+            [KeyboardButton(text="Редактировать"), KeyboardButton(text="Удалить")],
             [KeyboardButton(text="Назад")],
+        ],
+        resize_keyboard=True
+    )
+
+
+def delete_confirm_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Подтвердить удаление")],
+            [KeyboardButton(text="Отмена")],
         ],
         resize_keyboard=True
     )
@@ -517,7 +530,26 @@ async def account_detail_action(message: types.Message, state: FSMContext):
         return await render_accounts_list(message, state)
 
     if txt != "редактировать":
-        return await message.answer("Нажмите «Редактировать» или «Назад».", reply_markup=detail_actions_kb())
+        if txt == "удалить":
+            row = get_account_by_id(aid) if aid else None
+            if not row:
+                await state.clear()
+                return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+            st = row[6]
+            if st == "busy":
+                return await message.answer(
+                    "Этот аккаунт сейчас в аренде. Сначала освободите его, затем удаляйте.",
+                    reply_markup=detail_actions_kb()
+                )
+
+            await state.set_state(DeleteAccount.confirm)
+            return await message.answer(
+                "Подтвердите удаление аккаунта. Это действие необратимо.",
+                reply_markup=delete_confirm_kb()
+            )
+
+        return await message.answer("Нажмите «Редактировать», «Удалить» или «Назад».", reply_markup=detail_actions_kb())
 
     if not aid:
         await state.clear()
@@ -525,6 +557,59 @@ async def account_detail_action(message: types.Message, state: FSMContext):
 
     await state.set_state(EditAccount.choose_field)
     await message.answer("Что изменить?", reply_markup=edit_fields_kb())
+
+
+@dp.message(StateFilter(DeleteAccount.confirm))
+async def delete_account_confirm(message: types.Message, state: FSMContext):
+    txt = (message.text or "").strip().lower()
+    data = await state.get_data()
+    aid = data.get("selected_id")
+
+    if txt == "отмена":
+        await state.set_state(AccountDetails.view_action)
+        row = get_account_by_id(aid) if aid else None
+        if not row:
+            await state.clear()
+            return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+        return await message.answer(build_account_details_text(row), reply_markup=detail_actions_kb())
+
+    if txt != "подтвердить удаление":
+        return await message.answer("Нажмите «Подтвердить удаление» или «Отмена».", reply_markup=delete_confirm_kb())
+
+    if not aid:
+        await state.clear()
+        return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+    row = get_account_by_id(aid)
+    if not row:
+        await state.clear()
+        return await message.answer("Аккаунт уже удалён или не найден.", reply_markup=main_menu)
+
+    st = row[6]
+    login = row[0]
+
+    if st == "busy":
+        await state.set_state(AccountDetails.view_action)
+        return await message.answer(
+            "Нельзя удалить аккаунт, пока он занят. Сначала освободите его.",
+            reply_markup=detail_actions_kb()
+        )
+
+    try:
+        cursor.execute("DELETE FROM accounts WHERE id = ?", (aid,))
+        if cursor.rowcount == 0:
+            conn.rollback()
+            await state.clear()
+            return await message.answer("Аккаунт уже удалён или не найден.", reply_markup=main_menu)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"delete_account error: {e}")
+        await state.clear()
+        return await message.answer("Ошибка удаления аккаунта.", reply_markup=main_menu)
+
+    await state.clear()
+    await message.answer(f"Аккаунт {login} удалён.", reply_markup=main_menu)
 
 
 @dp.message(StateFilter(EditAccount.choose_field))
@@ -635,7 +720,22 @@ async def show_status(message: types.Message):
     free = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM accounts WHERE status='busy'")
     busy = cursor.fetchone()[0]
-    await message.answer(f"Свободных: {free}\nЗанятых: {busy}", reply_markup=main_menu)
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+          FROM accounts
+         WHERE status='free'
+           AND (faceit_email IS NOT NULL AND faceit_email != ''
+                OR faceit_password IS NOT NULL AND faceit_password != '')
+        """
+    )
+    free_faceit = cursor.fetchone()[0]
+    await message.answer(
+        f"Свободных: {free}\n"
+        f"Занятых: {busy}\n"
+        f"Свободных с Faceit: {free_faceit}",
+        reply_markup=main_menu
+    )
 
 # ────────────────────────────────────────────────
 #  Сдача в аренду
