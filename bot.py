@@ -36,14 +36,13 @@ os.makedirs(BACKUP_DIR, exist_ok=True)
 DATA_ENV_VALUES = dotenv_values(DATA_ENV_PATH) if os.path.exists(DATA_ENV_PATH) else {}
 
 FACEIT_API_KEY = FACEIT_API_KEY_RUNTIME or (DATA_ENV_VALUES.get("FACEIT_API_KEY") or "")
-FACEIT_API_KEY_SOURCE = "runtime env" if FACEIT_API_KEY_RUNTIME else ("data env file" if FACEIT_API_KEY else "missing")
 
 
 def log_runtime_config():
-    faceit_key = FACEIT_API_KEY
+    faceit_key, source = resolve_faceit_api_key_with_source()
     data_env_exists = os.path.exists(DATA_ENV_PATH)
     if faceit_key:
-        logging.info("FACEIT_API_KEY loaded: yes, length=%d, source=%s", len(faceit_key), FACEIT_API_KEY_SOURCE)
+        logging.info("FACEIT_API_KEY loaded: yes, length=%d, source=%s", len(faceit_key), source)
     else:
         logging.warning("FACEIT_API_KEY loaded: no, data_env_exists=%s", data_env_exists)
 
@@ -124,6 +123,67 @@ def create_backup_filename() -> str:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return os.path.join(BACKUP_DIR, f"accounts_{stamp}.db")
 
+
+def get_setting_raw(key: str) -> str | None:
+    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def set_setting_raw(key: str, value: str | None) -> None:
+    if value is None:
+        cursor.execute("DELETE FROM settings WHERE key = ?", (key,))
+    else:
+        cursor.execute(
+            """
+            INSERT INTO settings(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, value),
+        )
+    conn.commit()
+
+
+def get_faceit_api_key_from_storage() -> str:
+    raw_value = get_setting_raw("faceit_api_key")
+    if raw_value:
+        try:
+            return decrypt(raw_value) or ""
+        except Exception:
+            return ""
+    return ""
+
+
+def set_faceit_api_key(value: str | None) -> None:
+    if value is None or not value.strip():
+        set_setting_raw("faceit_api_key", None)
+        logging.info("FACEIT API key removed from settings")
+    else:
+        set_setting_raw("faceit_api_key", encrypt(value.strip()))
+        logging.info("FACEIT API key updated in settings")
+
+
+def resolve_faceit_api_key_with_source() -> tuple[str, str]:
+    stored_key = get_faceit_api_key_from_storage()
+    if stored_key:
+        return stored_key, "settings db"
+
+    runtime_key = (os.getenv("FACEIT_API_KEY") or "").strip()
+    if runtime_key:
+        return runtime_key, "runtime env"
+
+    file_key = (DATA_ENV_VALUES.get("FACEIT_API_KEY") or "").strip()
+    if file_key:
+        return file_key, "data env file"
+
+    return "", "missing"
+
+
+def resolve_faceit_api_key() -> str:
+    key, _ = resolve_faceit_api_key_with_source()
+    return key
+
 # ────────────────────────────────────────────────
 #  База данных
 # ────────────────────────────────────────────────
@@ -144,6 +204,12 @@ CREATE TABLE IF NOT EXISTS accounts (
     faceit_password TEXT,
     status          TEXT DEFAULT 'free',
     rent_end        TEXT
+)
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS settings (
+    key     TEXT PRIMARY KEY,
+    value   TEXT NOT NULL
 )
 """)
 conn.commit()
@@ -213,6 +279,8 @@ class DeleteAccount(StatesGroup):
 class DataBackup(StatesGroup):
     choose_action = State()
     restore_wait_file = State()
+    faceit_api_menu = State()
+    faceit_api_wait_key = State()
 
 # ────────────────────────────────────────────────
 #  Бот и клавиатуры
@@ -289,11 +357,12 @@ async def fetch_faceit_profile_stats(faceit_url: str | None) -> dict:
     if not nickname:
         return {"nickname": None, "elo": None, "level": None, "error": None}
 
-    if not FACEIT_API_KEY:
+    faceit_api_key = resolve_faceit_api_key()
+    if not faceit_api_key:
         return {"nickname": nickname, "elo": None, "level": None, "error": "FACEIT_API_KEY не задан"}
 
     url = "https://open.faceit.com/data/v4/players"
-    headers = {"Authorization": f"Bearer {FACEIT_API_KEY}"}
+    headers = {"Authorization": f"Bearer {faceit_api_key}"}
     timeout = aiohttp.ClientTimeout(total=15)
 
     async def fetch_for_game(game_name: str) -> tuple[dict | None, str | None]:
@@ -403,6 +472,18 @@ def data_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Создать копию"), KeyboardButton(text="Загрузить копию")],
+            [KeyboardButton(text="FACEIT API")],
+            [KeyboardButton(text="Назад")],
+        ],
+        resize_keyboard=True
+    )
+
+
+def faceit_api_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Ввести/обновить ключ")],
+            [KeyboardButton(text="Удалить ключ")],
             [KeyboardButton(text="Назад")],
         ],
         resize_keyboard=True
@@ -841,6 +922,15 @@ async def data_choose_action(message: types.Message, state: FSMContext):
             reply_markup=cancel_kb
         )
 
+    if txt == "faceit api":
+        current_key = resolve_faceit_api_key()
+        status_text = "установлен" if current_key else "не установлен"
+        await state.set_state(DataBackup.faceit_api_menu)
+        return await message.answer(
+            f"FACEIT API ключ: {status_text}.",
+            reply_markup=faceit_api_kb()
+        )
+
     return await message.answer("Выберите действие из меню.", reply_markup=data_menu_kb())
 
 
@@ -874,6 +964,54 @@ async def data_restore_file(message: types.Message, state: FSMContext):
             shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception:
             pass
+
+
+@dp.message(StateFilter(DataBackup.faceit_api_menu))
+async def faceit_api_menu(message: types.Message, state: FSMContext):
+    global FACEIT_API_KEY
+    txt = (message.text or "").strip().lower()
+
+    if txt == "назад":
+        await state.clear()
+        return await message.answer("Возврат в меню.", reply_markup=main_menu)
+
+    if txt == "ввести/обновить ключ":
+        await state.set_state(DataBackup.faceit_api_wait_key)
+        return await message.answer(
+            "Отправьте новый FACEIT API ключ одним сообщением.",
+            reply_markup=cancel_kb
+        )
+
+    if txt == "удалить ключ":
+        set_faceit_api_key(None)
+        FACEIT_API_KEY = resolve_faceit_api_key()
+        await state.clear()
+        return await message.answer("FACEIT API ключ удалён из базы.", reply_markup=main_menu)
+
+    current_key = resolve_faceit_api_key()
+    status_text = "установлен" if current_key else "не установлен"
+    return await message.answer(
+        f"FACEIT API ключ: {status_text}.",
+        reply_markup=faceit_api_kb()
+    )
+
+
+@dp.message(StateFilter(DataBackup.faceit_api_wait_key))
+async def faceit_api_wait_key(message: types.Message, state: FSMContext):
+    global FACEIT_API_KEY
+    key = (message.text or "").strip()
+
+    if key.lower() == "отмена":
+        await state.set_state(DataBackup.faceit_api_menu)
+        return await message.answer("Ввод ключа отменён.", reply_markup=faceit_api_kb())
+
+    if not key:
+        return await message.answer("Ключ не может быть пустым.", reply_markup=cancel_kb)
+
+    set_faceit_api_key(key)
+    FACEIT_API_KEY = resolve_faceit_api_key()
+    await state.set_state(DataBackup.faceit_api_menu)
+    await message.answer("FACEIT API ключ сохранён и активирован.", reply_markup=faceit_api_kb())
 
 
 @dp.message(StateFilter(EditAccount.choose_field))
@@ -1281,8 +1419,10 @@ async def checker_loop():
 # ────────────────────────────────────────────────
 
 async def main():
+    global FACEIT_API_KEY
     ensure_faceit_url_column()
     migrate_encryption()
+    FACEIT_API_KEY = resolve_faceit_api_key()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     log_runtime_config()
     asyncio.create_task(checker_loop())
