@@ -26,19 +26,27 @@ load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_RAW = os.getenv("ADMIN_ID") or ""
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
-FACEIT_API_KEY = os.getenv("FACEIT_API_KEY") or ""
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
+DATA_ENV_PATH = os.path.join(DATA_DIR, ".env")
+FACEIT_API_KEY_RUNTIME = os.getenv("FACEIT_API_KEY") or ""
 
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
+if os.path.exists(DATA_ENV_PATH):
+    load_dotenv(DATA_ENV_PATH, override=False)
+
+FACEIT_API_KEY = os.getenv("FACEIT_API_KEY") or ""
+FACEIT_API_KEY_SOURCE = "runtime env" if FACEIT_API_KEY_RUNTIME else ("data env file" if FACEIT_API_KEY else "missing")
+
 
 def log_runtime_config():
-    faceit_key = os.getenv("FACEIT_API_KEY") or ""
+    faceit_key = FACEIT_API_KEY
+    data_env_exists = os.path.exists(DATA_ENV_PATH)
     if faceit_key:
-        logging.info("FACEIT_API_KEY loaded: yes, length=%d", len(faceit_key))
+        logging.info("FACEIT_API_KEY loaded: yes, length=%d, source=%s", len(faceit_key), FACEIT_API_KEY_SOURCE)
     else:
-        logging.warning("FACEIT_API_KEY loaded: no")
+        logging.warning("FACEIT_API_KEY loaded: no, data_env_exists=%s", data_env_exists)
 
 def _parse_admin_ids(raw: str) -> list[int]:
     # Поддержка формата:
