@@ -3,7 +3,9 @@ import sqlite3
 import logging
 import os
 from datetime import datetime, timedelta
+from urllib.parse import urlparse, unquote
 
+import aiohttp
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -22,6 +24,7 @@ load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_RAW = os.getenv("ADMIN_ID") or ""
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
+FACEIT_API_KEY = os.getenv("FACEIT_API_KEY") or ""
 
 def _parse_admin_ids(raw: str) -> list[int]:
     # Поддержка формата:
@@ -105,6 +108,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     steam_password  TEXT,
     email           TEXT,
     email_password  TEXT,
+    faceit_url      TEXT,
     faceit_email    TEXT,
     faceit_password TEXT,
     status          TEXT DEFAULT 'free',
@@ -112,6 +116,13 @@ CREATE TABLE IF NOT EXISTS accounts (
 )
 """)
 conn.commit()
+
+def ensure_faceit_url_column():
+    cursor.execute("PRAGMA table_info(accounts)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "faceit_url" not in columns:
+        cursor.execute("ALTER TABLE accounts ADD COLUMN faceit_url TEXT")
+        conn.commit()
 
 def migrate_encryption():
     cursor.execute("SELECT id, steam_password, email_password, faceit_password FROM accounts")
@@ -141,6 +152,7 @@ class AddAccount(StatesGroup):
     email           = State()
     email_password  = State()
     faceit_choice   = State()
+    faceit_url      = State()
     faceit_email    = State()
     faceit_password = State()
     confirm         = State()
@@ -209,7 +221,7 @@ def clean_invalid_dates():
 def get_account_by_id(aid: int):
     cursor.execute(
         """
-        SELECT steam_login, steam_password, email, email_password, faceit_email, faceit_password, status, rent_end
+        SELECT steam_login, steam_password, email, email_password, faceit_url, faceit_email, faceit_password, status, rent_end
           FROM accounts
          WHERE id = ?
         """,
@@ -218,8 +230,73 @@ def get_account_by_id(aid: int):
     return cursor.fetchone()
 
 
-def build_account_details_text(row) -> str:
-    s_login, s_pw_enc, email, e_pw_enc, f_email, f_pw_enc, st, rent_end = row
+def extract_faceit_nickname(faceit_url: str | None) -> str | None:
+    if not faceit_url:
+        return None
+
+    raw = faceit_url.strip()
+    if not raw:
+        return None
+
+    if "faceit.com" in raw:
+        parsed = urlparse(raw)
+        parts = [part for part in parsed.path.split("/") if part]
+        if parts:
+            return unquote(parts[-1]).strip() or None
+        return None
+
+    return raw
+
+
+async def fetch_faceit_profile_stats(faceit_url: str | None) -> dict:
+    nickname = extract_faceit_nickname(faceit_url)
+    if not nickname:
+        return {"nickname": None, "elo": None, "level": None, "error": None}
+
+    if not FACEIT_API_KEY:
+        return {"nickname": nickname, "elo": None, "level": None, "error": "FACEIT_API_KEY не задан"}
+
+    url = "https://open.faceit.com/data/v4/players"
+    headers = {"Authorization": f"Bearer {FACEIT_API_KEY}"}
+    timeout = aiohttp.ClientTimeout(total=15)
+
+    async def fetch_for_game(game_name: str) -> tuple[dict | None, str | None]:
+        params = {"nickname": nickname, "game": game_name}
+        try:
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                async with session.get(url, params=params) as response:
+                    if response.status != 200:
+                        return None, f"HTTP {response.status}"
+                    data = await response.json()
+        except Exception as e:
+            return None, str(e)
+
+        games = data.get("games") or {}
+        return (games.get("cs2") or games.get("csgo") or {}), None
+
+    game, error = await fetch_for_game("cs2")
+    if not game:
+        fallback_game, fallback_error = await fetch_for_game("csgo")
+        if fallback_game:
+            game = fallback_game
+            error = None
+        else:
+            error = fallback_error or error
+
+    game = game or {}
+    elo = game.get("faceit_elo")
+    level = game.get("skill_level")
+
+    return {
+        "nickname": nickname,
+        "elo": elo,
+        "level": level,
+        "error": error,
+    }
+
+
+async def build_account_details_text(row) -> str:
+    s_login, s_pw_enc, email, e_pw_enc, f_url, f_email, f_pw_enc, st, rent_end = row
     s_pw = decrypt(s_pw_enc)
     e_pw = decrypt(e_pw_enc)
     f_pw = decrypt(f_pw_enc) if f_pw_enc is not None else None
@@ -237,13 +314,23 @@ def build_account_details_text(row) -> str:
         f"  Пароль: {e_pw or '-'}",
     ]
 
-    if f_email or f_pw_enc:
+    if f_url or f_email or f_pw_enc:
+        faceit_stats = await fetch_faceit_profile_stats(f_url)
         details_lines.extend([
             "",
             "Faceit:",
+            f"  Ссылка: {f_url or '-'}",
+            f"  Ник: {faceit_stats['nickname'] or '-'}",
             f"  Email: {f_email or '-'}",
             f"  Пароль: {f_pw or '-'}",
         ])
+        if faceit_stats["elo"] is not None:
+            details_lines.append(f"  Elo: {faceit_stats['elo']}")
+            if faceit_stats["level"] is not None:
+                details_lines.append(f"  Уровень: {faceit_stats['level']}")
+        else:
+            reason = faceit_stats["error"] or "не удалось получить"
+            details_lines.append(f"  Elo: недоступно ({reason})")
 
     if st == "busy" and rent_end:
         try:
@@ -281,7 +368,8 @@ def edit_fields_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="Steam логин"), KeyboardButton(text="Steam пароль")],
             [KeyboardButton(text="Email"), KeyboardButton(text="Пароль email")],
-            [KeyboardButton(text="Faceit email"), KeyboardButton(text="Пароль Faceit")],
+            [KeyboardButton(text="Faceit ссылка"), KeyboardButton(text="Faceit email")],
+            [KeyboardButton(text="Пароль Faceit")],
             [KeyboardButton(text="Назад")],
         ],
         resize_keyboard=True
@@ -374,13 +462,27 @@ async def add_email_pw(message: types.Message, state: FSMContext):
 async def add_faceit_choice(message: types.Message, state: FSMContext):
     txt = message.text.lower().strip()
     if txt == "да":
-        await state.set_state(AddAccount.faceit_email)
-        await message.answer("Email Faceit:", reply_markup=cancel_kb)
+        await state.set_state(AddAccount.faceit_url)
+        await message.answer(
+            "Ссылка на Faceit профиль:\n"
+            "Пример: https://www.faceit.com/ru/players/Rinaharl",
+            reply_markup=cancel_kb
+        )
     elif txt == "нет":
-        await state.update_data(faceit_email=None, faceit_password=None)
+        await state.update_data(faceit_url=None, faceit_email=None, faceit_password=None)
         await show_confirm_add(message, state)
     else:
         await message.answer("Ответьте «да» или «нет».", reply_markup=cancel_kb)
+
+@dp.message(StateFilter(AddAccount.faceit_url))
+async def add_faceit_url(message: types.Message, state: FSMContext):
+    value = (message.text or "").strip()
+    if not value:
+        return await message.answer("Ссылка не может быть пустой.", reply_markup=cancel_kb)
+
+    await state.update_data(faceit_url=value)
+    await state.set_state(AddAccount.faceit_email)
+    await message.answer("Email Faceit:", reply_markup=cancel_kb)
 
 @dp.message(StateFilter(AddAccount.faceit_email))
 async def add_faceit_email(message: types.Message, state: FSMContext):
@@ -399,7 +501,8 @@ async def show_confirm_add(message: types.Message, state: FSMContext):
         f"Подтвердите добавление:\n\n"
         f"Steam: {d['steam_login']} : ********\n"
         f"Email: {d['email']} : ********\n"
-        f"Faceit: {d.get('faceit_email') or 'Нет'}"
+        f"Faceit ссылка: {d.get('faceit_url') or 'Нет'}\n"
+        f"Faceit email: {d.get('faceit_email') or 'Нет'}"
     )
     kb = ReplyKeyboardMarkup(
         keyboard=[
@@ -429,13 +532,14 @@ async def add_confirm(message: types.Message, state: FSMContext):
         cursor.execute("""
             INSERT INTO accounts (
                 steam_login, steam_password, email, email_password,
-                faceit_email, faceit_password, status
-            ) VALUES (?, ?, ?, ?, ?, ?, 'free')
+                faceit_url, faceit_email, faceit_password, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'free')
         """, (
             login,
             encrypt(d["steam_password"]),
             d["email"],
             encrypt(d["email_password"]),
+            d.get("faceit_url"),
             d.get("faceit_email"),
             encrypt(d.get("faceit_password"))
         ))
@@ -516,7 +620,7 @@ async def show_account_details(message: types.Message, state: FSMContext):
 
     await state.update_data(selected_id=aid, selected_login=login)
     await state.set_state(AccountDetails.view_action)
-    await message.answer(build_account_details_text(row), reply_markup=detail_actions_kb())
+    await message.answer(await build_account_details_text(row), reply_markup=detail_actions_kb())
 
 
 @dp.message(StateFilter(AccountDetails.view_action))
@@ -536,7 +640,7 @@ async def account_detail_action(message: types.Message, state: FSMContext):
                 await state.clear()
                 return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
 
-            st = row[6]
+            st = row[7]
             if st == "busy":
                 return await message.answer(
                     "Этот аккаунт сейчас в аренде. Сначала освободите его, затем удаляйте.",
@@ -571,7 +675,7 @@ async def delete_account_confirm(message: types.Message, state: FSMContext):
         if not row:
             await state.clear()
             return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
-        return await message.answer(build_account_details_text(row), reply_markup=detail_actions_kb())
+        return await message.answer(await build_account_details_text(row), reply_markup=detail_actions_kb())
 
     if txt != "подтвердить удаление":
         return await message.answer("Нажмите «Подтвердить удаление» или «Отмена».", reply_markup=delete_confirm_kb())
@@ -585,7 +689,7 @@ async def delete_account_confirm(message: types.Message, state: FSMContext):
         await state.clear()
         return await message.answer("Аккаунт уже удалён или не найден.", reply_markup=main_menu)
 
-    st = row[6]
+    st = row[7]
     login = row[0]
 
     if st == "busy":
@@ -628,13 +732,14 @@ async def edit_choose_field(message: types.Message, state: FSMContext):
             return await message.answer("Ошибка: аккаунт не найден в базе.", reply_markup=main_menu)
 
         await state.set_state(AccountDetails.view_action)
-        return await message.answer(build_account_details_text(row), reply_markup=detail_actions_kb())
+        return await message.answer(await build_account_details_text(row), reply_markup=detail_actions_kb())
 
     field_map = {
         "steam логин": ("steam_login", "Steam логин", False),
         "steam пароль": ("steam_password", "Steam пароль", False),
         "email": ("email", "Email", True),
         "пароль email": ("email_password", "Пароль email", True),
+        "faceit ссылка": ("faceit_url", "Faceit ссылка", True),
         "faceit email": ("faceit_email", "Faceit email", True),
         "пароль faceit": ("faceit_password", "Пароль Faceit", True),
     }
@@ -706,7 +811,7 @@ async def edit_enter_value(message: types.Message, state: FSMContext):
     await state.update_data(selected_login=row[0])
     await state.set_state(AccountDetails.view_action)
     await message.answer(f"Поле «{label}» обновлено.", reply_markup=detail_actions_kb())
-    await message.answer(build_account_details_text(row), reply_markup=detail_actions_kb())
+    await message.answer(await build_account_details_text(row), reply_markup=detail_actions_kb())
 
 # ────────────────────────────────────────────────
 #  Статус
@@ -725,8 +830,11 @@ async def show_status(message: types.Message):
         SELECT COUNT(*)
           FROM accounts
          WHERE status='free'
-           AND (faceit_email IS NOT NULL AND faceit_email != ''
-                OR faceit_password IS NOT NULL AND faceit_password != '')
+           AND (
+                (faceit_url IS NOT NULL AND faceit_url != '')
+                OR (faceit_email IS NOT NULL AND faceit_email != '')
+                OR (faceit_password IS NOT NULL AND faceit_password != '')
+           )
         """
     )
     free_faceit = cursor.fetchone()[0]
@@ -1010,6 +1118,7 @@ async def checker_loop():
 # ────────────────────────────────────────────────
 
 async def main():
+    ensure_faceit_url_column()
     migrate_encryption()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     asyncio.create_task(checker_loop())

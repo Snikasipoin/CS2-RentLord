@@ -275,6 +275,9 @@ pip install -r requirements.txt
 
 BOT_TOKEN=
 ADMIN_ID=
+FACEIT_API_KEY=
+
+FACEIT_API_KEY нужен для того, чтобы бот мог подтягивать текущий FACEIT Elo по ссылке профиля.
 
 
 Запустить:
