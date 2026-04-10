@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlparse, unquote
 
 import aiohttp
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
 from cryptography.fernet import Fernet, InvalidToken
 
 from aiogram import Bot, Dispatcher, types, F
@@ -33,10 +33,9 @@ FACEIT_API_KEY_RUNTIME = os.getenv("FACEIT_API_KEY") or ""
 
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
-if os.path.exists(DATA_ENV_PATH):
-    load_dotenv(DATA_ENV_PATH, override=False)
+DATA_ENV_VALUES = dotenv_values(DATA_ENV_PATH) if os.path.exists(DATA_ENV_PATH) else {}
 
-FACEIT_API_KEY = os.getenv("FACEIT_API_KEY") or ""
+FACEIT_API_KEY = FACEIT_API_KEY_RUNTIME or (DATA_ENV_VALUES.get("FACEIT_API_KEY") or "")
 FACEIT_API_KEY_SOURCE = "runtime env" if FACEIT_API_KEY_RUNTIME else ("data env file" if FACEIT_API_KEY else "missing")
 
 
