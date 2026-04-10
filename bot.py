@@ -2,6 +2,8 @@
 import sqlite3
 import logging
 import os
+import shutil
+import tempfile
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, unquote
 
@@ -11,7 +13,7 @@ from cryptography.fernet import Fernet, InvalidToken
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
@@ -25,6 +27,18 @@ TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_RAW = os.getenv("ADMIN_ID") or ""
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 FACEIT_API_KEY = os.getenv("FACEIT_API_KEY") or ""
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+BACKUP_DIR = os.path.join(DATA_DIR, "backups")
+
+os.makedirs(BACKUP_DIR, exist_ok=True)
+
+
+def log_runtime_config():
+    faceit_key = os.getenv("FACEIT_API_KEY") or ""
+    if faceit_key:
+        logging.info("FACEIT_API_KEY loaded: yes, length=%d", len(faceit_key))
+    else:
+        logging.warning("FACEIT_API_KEY loaded: no")
 
 def _parse_admin_ids(raw: str) -> list[int]:
     # Поддержка формата:
@@ -94,12 +108,22 @@ def decrypt(encrypted: str | None) -> str | None:
     except InvalidToken:
         return "[ошибка расшифровки — старый формат]"
 
+
+def get_db_path() -> str:
+    return os.path.abspath("accounts.db")
+
+
+def create_backup_filename() -> str:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(BACKUP_DIR, f"accounts_{stamp}.db")
+
 # ────────────────────────────────────────────────
 #  База данных
 # ────────────────────────────────────────────────
 
 conn = sqlite3.connect("accounts.db", check_same_thread=False)
 cursor = conn.cursor()
+DB_MAINTENANCE = False
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS accounts (
@@ -179,6 +203,10 @@ class EditAccount(StatesGroup):
 class DeleteAccount(StatesGroup):
     confirm = State()
 
+class DataBackup(StatesGroup):
+    choose_action = State()
+    restore_wait_file = State()
+
 # ────────────────────────────────────────────────
 #  Бот и клавиатуры
 # ────────────────────────────────────────────────
@@ -195,7 +223,8 @@ main_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Статус"),     KeyboardButton(text="📦 Аккаунты")],
         [KeyboardButton(text="➕ Добавить"),    KeyboardButton(text="🎮 Сдать")],
-        [KeyboardButton(text="⏱ Продлить"),    KeyboardButton(text="✅ Освободить")]
+        [KeyboardButton(text="⏱ Продлить"),    KeyboardButton(text="✅ Освободить")],
+        [KeyboardButton(text="💾 Данные")]
     ],
     resize_keyboard=True
 )
@@ -363,6 +392,16 @@ def delete_confirm_kb() -> ReplyKeyboardMarkup:
     )
 
 
+def data_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Создать копию"), KeyboardButton(text="Загрузить копию")],
+            [KeyboardButton(text="Назад")],
+        ],
+        resize_keyboard=True
+    )
+
+
 def edit_fields_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -399,6 +438,40 @@ def parse_extend_delta(text: str) -> timedelta | None:
     if unit.startswith("час"):
         return timedelta(hours=amount)
     return None
+
+
+def write_database_backup(backup_path: str) -> None:
+    conn.commit()
+    dest = sqlite3.connect(backup_path)
+    try:
+        conn.backup(dest)
+        dest.commit()
+    finally:
+        dest.close()
+
+
+def validate_backup_file(backup_path: str) -> None:
+    test_conn = sqlite3.connect(backup_path)
+    try:
+        test_cursor = test_conn.cursor()
+        test_cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='accounts'")
+        if test_cursor.fetchone() is None:
+            raise ValueError("В копии нет таблицы accounts")
+    finally:
+        test_conn.close()
+
+
+def restore_database_from_file(backup_path: str) -> None:
+    conn.commit()
+    src = sqlite3.connect(backup_path)
+    try:
+        src.backup(conn)
+        conn.commit()
+    finally:
+        src.close()
+
+    ensure_faceit_url_column()
+    migrate_encryption()
 
 # ────────────────────────────────────────────────
 #  Отмена любого состояния
@@ -714,6 +787,86 @@ async def delete_account_confirm(message: types.Message, state: FSMContext):
 
     await state.clear()
     await message.answer(f"Аккаунт {login} удалён.", reply_markup=main_menu)
+
+
+@dp.message(F.text == "💾 Данные")
+async def data_menu(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    await state.clear()
+    await state.set_state(DataBackup.choose_action)
+    await message.answer("Раздел данных: резервная копия или восстановление?", reply_markup=data_menu_kb())
+
+
+@dp.message(StateFilter(DataBackup.choose_action))
+async def data_choose_action(message: types.Message, state: FSMContext):
+    global DB_MAINTENANCE
+    txt = (message.text or "").strip().lower()
+
+    if txt == "назад":
+        await state.clear()
+        return await message.answer("Возврат в меню.", reply_markup=main_menu)
+
+    if txt == "создать копию":
+        backup_path = create_backup_filename()
+        try:
+            DB_MAINTENANCE = True
+            await asyncio.to_thread(write_database_backup, backup_path)
+        except Exception as e:
+            logging.error(f"backup create error: {e}")
+            return await message.answer("Не удалось создать резервную копию.", reply_markup=data_menu_kb())
+        finally:
+            DB_MAINTENANCE = False
+
+        await message.answer(
+            "Резервная копия создана. Отправляю файл.",
+            reply_markup=data_menu_kb()
+        )
+        await message.answer_document(
+            document=FSInputFile(backup_path),
+            caption="Резервная копия базы данных"
+        )
+        return
+
+    if txt == "загрузить копию":
+        await state.set_state(DataBackup.restore_wait_file)
+        return await message.answer(
+            "Пришлите сюда файл `.db` резервной копии.",
+            reply_markup=cancel_kb
+        )
+
+    return await message.answer("Выберите действие из меню.", reply_markup=data_menu_kb())
+
+
+@dp.message(StateFilter(DataBackup.restore_wait_file))
+async def data_restore_file(message: types.Message, state: FSMContext):
+    global DB_MAINTENANCE
+    if not message.document:
+        return await message.answer("Нужно отправить файл `.db` документом.", reply_markup=cancel_kb)
+
+    filename = message.document.file_name or "backup.db"
+    if not filename.lower().endswith(".db"):
+        return await message.answer("Нужен файл с расширением `.db`.", reply_markup=cancel_kb)
+
+    temp_dir = tempfile.mkdtemp(prefix="faceit_restore_", dir=BACKUP_DIR)
+    temp_path = os.path.join(temp_dir, filename)
+
+    try:
+        await bot.download(message.document, destination=temp_path)
+        validate_backup_file(temp_path)
+
+        DB_MAINTENANCE = True
+        await asyncio.to_thread(restore_database_from_file, temp_path)
+        await state.clear()
+        await message.answer("База данных восстановлена из копии.", reply_markup=main_menu)
+    except Exception as e:
+        logging.error(f"restore error: {e}")
+        await message.answer("Не удалось восстановить базу из этого файла.", reply_markup=cancel_kb)
+    finally:
+        DB_MAINTENANCE = False
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 @dp.message(StateFilter(EditAccount.choose_field))
@@ -1093,6 +1246,9 @@ async def extend_confirm(message: types.Message, state: FSMContext):
 async def checker_loop():
     while True:
         try:
+            if DB_MAINTENANCE:
+                await asyncio.sleep(5)
+                continue
             clean_invalid_dates()
             cursor.execute("SELECT id, steam_login, rent_end FROM accounts WHERE status='busy'")
             for row in cursor.fetchall():
@@ -1121,6 +1277,7 @@ async def main():
     ensure_faceit_url_column()
     migrate_encryption()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log_runtime_config()
     asyncio.create_task(checker_loop())
     print("Бот запущен")
     await dp.start_polling(bot, allowed_updates=["message"])
