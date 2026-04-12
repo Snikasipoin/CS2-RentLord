@@ -4,7 +4,7 @@ import logging
 import os
 import shutil
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, unquote
 
 import aiohttp
@@ -45,6 +45,7 @@ def log_runtime_config():
         logging.info("FACEIT_API_KEY loaded: yes, length=%d, source=%s", len(faceit_key), source)
     else:
         logging.warning("FACEIT_API_KEY loaded: no, data_env_exists=%s", data_env_exists)
+
 
 def _parse_admin_ids(raw: str) -> list[int]:
     # Поддержка формата:
@@ -214,6 +215,30 @@ CREATE TABLE IF NOT EXISTS settings (
 """)
 conn.commit()
 
+
+def ensure_faceit_block_columns():
+    cursor.execute("PRAGMA table_info(accounts)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    additions = [
+        ("faceit_blocked", "INTEGER DEFAULT 0"),
+        ("faceit_block_ends_at", "TEXT"),
+        ("faceit_block_reason", "TEXT"),
+        ("faceit_block_type", "TEXT"),
+        ("faceit_block_game", "TEXT"),
+        ("faceit_ban_signature", "TEXT"),
+        ("faceit_block_last_checked_at", "TEXT"),
+    ]
+
+    changed = False
+    for column_name, column_def in additions:
+        if column_name not in columns:
+            cursor.execute(f"ALTER TABLE accounts ADD COLUMN {column_name} {column_def}")
+            changed = True
+
+    if changed:
+        conn.commit()
+
 def ensure_faceit_url_column():
     cursor.execute("PRAGMA table_info(accounts)")
     columns = {row[1] for row in cursor.fetchall()}
@@ -282,6 +307,10 @@ class DataBackup(StatesGroup):
     faceit_api_menu = State()
     faceit_api_wait_key = State()
 
+
+class StatusMenu(StatesGroup):
+    menu = State()
+
 # ────────────────────────────────────────────────
 #  Бот и клавиатуры
 # ────────────────────────────────────────────────
@@ -304,6 +333,16 @@ main_menu = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+
+def status_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Проверка блокировок Faceit")],
+            [KeyboardButton(text="Назад")],
+        ],
+        resize_keyboard=True
+    )
+
 # ────────────────────────────────────────────────
 #  Вспомогательные функции
 # ────────────────────────────────────────────────
@@ -322,10 +361,57 @@ def clean_invalid_dates():
         logging.error(f"clean_invalid_dates error: {e}")
 
 
+def clean_expired_faceit_blocks():
+    try:
+        cursor.execute(
+            """
+            SELECT id, faceit_block_ends_at
+              FROM accounts
+             WHERE faceit_blocked = 1
+               AND faceit_block_ends_at IS NOT NULL
+            """
+        )
+        expired_ids = []
+        for aid, ends_at_raw in cursor.fetchall():
+            ends_at = parse_iso_datetime(ends_at_raw)
+            if ends_at is None:
+                continue
+            local_now = datetime.now(ends_at.tzinfo) if ends_at.tzinfo else datetime.now()
+            if ends_at <= local_now:
+                expired_ids.append(aid)
+
+        for aid in expired_ids:
+            cursor.execute(
+                """
+                UPDATE accounts
+                   SET faceit_blocked = 0,
+                       faceit_block_ends_at = NULL,
+                       faceit_block_reason = NULL,
+                       faceit_block_type = NULL,
+                       faceit_block_game = NULL,
+                       faceit_ban_signature = NULL,
+                       faceit_block_last_checked_at = NULL
+                 WHERE id = ?
+                """,
+                (aid,),
+            )
+        if expired_ids:
+            conn.commit()
+    except Exception as e:
+        logging.error(f"clean_expired_faceit_blocks error: {e}")
+
+
 def get_account_by_id(aid: int):
     cursor.execute(
         """
-        SELECT steam_login, steam_password, email, email_password, faceit_url, faceit_email, faceit_password, status, rent_end
+        SELECT steam_login, steam_password, email, email_password, faceit_url, faceit_email, faceit_password, status, rent_end,
+               COALESCE(faceit_blocked, 0),
+               faceit_block_ends_at,
+               faceit_block_reason,
+               faceit_block_type,
+               faceit_block_game,
+               faceit_ban_signature,
+               faceit_block_last_checked_at
           FROM accounts
          WHERE id = ?
         """,
@@ -355,35 +441,40 @@ def extract_faceit_nickname(faceit_url: str | None) -> str | None:
 async def fetch_faceit_profile_stats(faceit_url: str | None) -> dict:
     nickname = extract_faceit_nickname(faceit_url)
     if not nickname:
-        return {"nickname": None, "elo": None, "level": None, "error": None}
+        return {"nickname": None, "player_id": None, "elo": None, "level": None, "error": None}
 
     faceit_api_key = resolve_faceit_api_key()
     if not faceit_api_key:
-        return {"nickname": nickname, "elo": None, "level": None, "error": "FACEIT_API_KEY не задан"}
+        return {"nickname": nickname, "player_id": None, "elo": None, "level": None, "error": "FACEIT_API_KEY не задан"}
 
     url = "https://open.faceit.com/data/v4/players"
     headers = {"Authorization": f"Bearer {faceit_api_key}"}
     timeout = aiohttp.ClientTimeout(total=15)
 
-    async def fetch_for_game(game_name: str) -> tuple[dict | None, str | None]:
+    async def fetch_for_game(game_name: str) -> tuple[dict | None, str | None, str | None]:
         params = {"nickname": nickname, "game": game_name}
         try:
             async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
                 async with session.get(url, params=params) as response:
                     if response.status != 200:
-                        return None, f"HTTP {response.status}"
+                        return None, None, f"HTTP {response.status}"
                     data = await response.json()
         except Exception as e:
-            return None, str(e)
+            return None, None, str(e)
 
         games = data.get("games") or {}
-        return (games.get("cs2") or games.get("csgo") or {}), None
+        player_id = data.get("player_id") or data.get("user_id") or data.get("id")
+        payload = games.get("cs2") or games.get("csgo") or {}
+        return payload, player_id, None
 
-    game, error = await fetch_for_game("cs2")
+    game, player_id, error = await fetch_for_game("cs2")
     if not game:
-        fallback_game, fallback_error = await fetch_for_game("csgo")
+        fallback_game, fallback_player_id, fallback_error = await fetch_for_game("csgo")
         if fallback_game:
             game = fallback_game
+        if not player_id:
+            player_id = fallback_player_id
+        if fallback_game:
             error = None
         else:
             error = fallback_error or error
@@ -394,17 +485,234 @@ async def fetch_faceit_profile_stats(faceit_url: str | None) -> dict:
 
     return {
         "nickname": nickname,
+        "player_id": player_id,
         "elo": elo,
         "level": level,
         "error": error,
     }
 
 
+def parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def format_remaining_time(end_at: datetime | None) -> str:
+    if end_at is None:
+        return "неизвестно"
+
+    now = datetime.now(end_at.tzinfo) if end_at.tzinfo else datetime.now()
+    delta = end_at - now
+    total_seconds = int(delta.total_seconds())
+    if total_seconds <= 0:
+        return "0м"
+
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+
+    parts = []
+    if days:
+        parts.append(f"{days}д")
+    if hours:
+        parts.append(f"{hours}ч")
+    if minutes:
+        parts.append(f"{minutes}м")
+
+    return " ".join(parts) if parts else "0м"
+
+
+async def resolve_faceit_player_id(faceit_url: str | None) -> tuple[str | None, str | None]:
+    stats = await fetch_faceit_profile_stats(faceit_url)
+    return stats.get("player_id"), stats.get("error")
+
+
+async def fetch_faceit_active_ban(faceit_url: str | None) -> dict:
+    nickname = extract_faceit_nickname(faceit_url)
+    if not nickname:
+        return {"nickname": None, "player_id": None, "ban": None, "error": None}
+
+    player_id, error = await resolve_faceit_player_id(faceit_url)
+    if not player_id:
+        return {"nickname": nickname, "player_id": None, "ban": None, "error": error or "Не удалось определить player_id"}
+
+    faceit_api_key = resolve_faceit_api_key()
+    if not faceit_api_key:
+        return {"nickname": nickname, "player_id": player_id, "ban": None, "error": "FACEIT_API_KEY не задан"}
+
+    url = f"https://open.faceit.com/data/v4/players/{player_id}/bans"
+    headers = {"Authorization": f"Bearer {faceit_api_key}"}
+    timeout = aiohttp.ClientTimeout(total=15)
+
+    try:
+        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    return {
+                        "nickname": nickname,
+                        "player_id": player_id,
+                        "ban": None,
+                        "error": f"HTTP {response.status}",
+                    }
+                data = await response.json()
+    except Exception as e:
+        return {"nickname": nickname, "player_id": player_id, "ban": None, "error": str(e)}
+
+    now = datetime.now(timezone.utc)
+    active_bans = []
+    for item in data.get("items", []):
+        ends_at = parse_iso_datetime(item.get("ends_at"))
+        starts_at = parse_iso_datetime(item.get("starts_at"))
+        if ends_at is None or ends_at <= now:
+            continue
+        active_bans.append({
+            "ban_id": item.get("banId") or item.get("ban_id") or "",
+            "game": item.get("game") or "",
+            "nickname": item.get("nickname") or nickname,
+            "reason": item.get("reason") or "",
+            "type": item.get("type") or "",
+            "starts_at": starts_at,
+            "ends_at": ends_at,
+            "user_id": item.get("user_id") or player_id,
+        })
+
+    if not active_bans:
+        return {"nickname": nickname, "player_id": player_id, "ban": None, "error": None}
+
+    active_bans.sort(key=lambda x: x["ends_at"])
+    return {"nickname": nickname, "player_id": player_id, "ban": active_bans[-1], "error": None}
+
+
+async def sync_faceit_bans(send_notifications: bool = False) -> dict:
+    api_key = resolve_faceit_api_key()
+    if not api_key:
+        return {
+            "active_blocks": [],
+            "blocked_count": 0,
+            "notifications": [],
+            "errors": ["FACEIT_API_KEY не задан"],
+        }
+
+    clean_expired_faceit_blocks()
+    cursor.execute(
+        """
+        SELECT id, steam_login, faceit_url, faceit_blocked, faceit_block_ends_at, faceit_ban_signature
+          FROM accounts
+         WHERE faceit_url IS NOT NULL
+           AND TRIM(faceit_url) != ''
+         ORDER BY steam_login
+        """
+    )
+    rows = cursor.fetchall()
+
+    active_blocks = []
+    notifications = []
+    errors = []
+    updated_count = 0
+
+    for aid, steam_login, faceit_url, faceit_blocked, faceit_block_ends_at, faceit_ban_signature in rows:
+        result = await fetch_faceit_active_ban(faceit_url)
+        error = result.get("error")
+        ban = result.get("ban")
+        now = datetime.now(timezone.utc)
+
+        if error:
+            errors.append(f"{steam_login}: {error}")
+            continue
+
+        if ban is None:
+            if faceit_blocked:
+                cursor.execute(
+                    """
+                    UPDATE accounts
+                       SET faceit_blocked = 0,
+                           faceit_block_ends_at = NULL,
+                           faceit_block_reason = NULL,
+                           faceit_block_type = NULL,
+                           faceit_block_game = NULL,
+                           faceit_ban_signature = NULL,
+                           faceit_block_last_checked_at = ?
+                     WHERE id = ?
+                    """,
+                    (now.isoformat(), aid),
+                )
+                updated_count += 1
+            else:
+                cursor.execute(
+                    "UPDATE accounts SET faceit_block_last_checked_at = ? WHERE id = ?",
+                    (now.isoformat(), aid),
+                )
+            continue
+
+        signature = f"{ban.get('ban_id') or ''}:{ban.get('ends_at').isoformat()}"
+        active_blocks.append({
+            "id": aid,
+            "login": steam_login,
+            "nickname": result.get("nickname") or steam_login,
+            "reason": ban.get("reason") or "-",
+            "type": ban.get("type") or "-",
+            "game": ban.get("game") or "-",
+            "ends_at": ban.get("ends_at"),
+        })
+
+        newly_detected = (not faceit_blocked) or (faceit_ban_signature != signature)
+        cursor.execute(
+            """
+            UPDATE accounts
+               SET faceit_blocked = 1,
+                   faceit_block_ends_at = ?,
+                   faceit_block_reason = ?,
+                   faceit_block_type = ?,
+                   faceit_block_game = ?,
+                   faceit_ban_signature = ?,
+                   faceit_block_last_checked_at = ?
+             WHERE id = ?
+            """,
+            (
+                ban.get("ends_at").isoformat(),
+                ban.get("reason") or None,
+                ban.get("type") or None,
+                ban.get("game") or None,
+                signature,
+                now.isoformat(),
+                aid,
+            ),
+        )
+        if newly_detected and send_notifications:
+            notifications.append(
+                "🔒 Найдена блокировка Faceit\n"
+                f"Аккаунт: {steam_login}\n"
+                f"Ник: {result.get('nickname') or steam_login}\n"
+                f"Срок блокировки: {format_remaining_time(ban.get('ends_at'))}\n"
+                f"До окончания: {ban.get('ends_at').astimezone().strftime('%d.%m.%Y %H:%M') if ban.get('ends_at').tzinfo else ban.get('ends_at').strftime('%d.%m.%Y %H:%M')}\n"
+                f"Причина: {ban.get('reason') or '-'}"
+            )
+        updated_count += 1
+
+    if updated_count:
+        conn.commit()
+
+    return {
+        "active_blocks": active_blocks,
+        "blocked_count": len(active_blocks),
+        "notifications": notifications,
+        "errors": errors,
+    }
+
+
 async def build_account_details_text(row) -> str:
-    s_login, s_pw_enc, email, e_pw_enc, f_url, f_email, f_pw_enc, st, rent_end = row
+    s_login, s_pw_enc, email, e_pw_enc, f_url, f_email, f_pw_enc, st, rent_end, *rest = row
     s_pw = decrypt(s_pw_enc)
     e_pw = decrypt(e_pw_enc)
     f_pw = decrypt(f_pw_enc) if f_pw_enc is not None else None
+    faceit_blocked = bool(rest[0]) if len(rest) > 0 and rest[0] is not None else False
+    faceit_block_ends_at = rest[1] if len(rest) > 1 else None
+    faceit_block_reason = rest[2] if len(rest) > 2 else None
+    faceit_block_type = rest[3] if len(rest) > 3 else None
 
     details_lines = [
         f"Данные аккаунта: {s_login}",
@@ -437,7 +745,27 @@ async def build_account_details_text(row) -> str:
             reason = faceit_stats["error"] or "не удалось получить"
             details_lines.append(f"  Elo: недоступно ({reason})")
 
-    if st == "busy" and rent_end:
+    block_dt = parse_iso_datetime(faceit_block_ends_at)
+    if faceit_blocked and block_dt:
+        details_lines.extend([
+            "",
+            "Faceit блокировка:",
+            "  Статус: активна",
+            f"  Тип: {faceit_block_type or '-'}",
+            f"  Причина: {faceit_block_reason or '-'}",
+            f"  До конца блокировки: {format_remaining_time(block_dt)}",
+        ])
+    elif faceit_blocked:
+        details_lines.extend([
+            "",
+            "Faceit блокировка:",
+            "  Статус: активна",
+            f"  Тип: {faceit_block_type or '-'}",
+            f"  Причина: {faceit_block_reason or '-'}",
+            "  До конца блокировки: неизвестно",
+        ])
+
+    if st == "busy" and rent_end and not faceit_blocked:
         try:
             dt = datetime.fromisoformat(rent_end)
             mins = max(0, int((dt - datetime.now()).total_seconds() / 60))
@@ -724,13 +1052,21 @@ async def add_confirm(message: types.Message, state: FSMContext):
 async def show_accounts(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
     clean_invalid_dates()
+    clean_expired_faceit_blocks()
+    await sync_faceit_bans(send_notifications=False)
 
     await render_accounts_list(message, state)
 
 
 async def render_accounts_list(message: types.Message, state: FSMContext):
     await state.clear()
-    cursor.execute("SELECT id, steam_login, status, rent_end FROM accounts ORDER BY steam_login")
+    cursor.execute(
+        """
+        SELECT id, steam_login, status, rent_end, faceit_blocked, faceit_block_ends_at
+          FROM accounts
+         ORDER BY steam_login
+        """
+    )
     rows = cursor.fetchall()
 
     if not rows:
@@ -738,9 +1074,15 @@ async def render_accounts_list(message: types.Message, state: FSMContext):
 
     lines = []
     rows_data = []
-    for aid, login, st, end in rows:
-        rows_data.append({"id": aid, "login": login, "status": st, "end": end})
-        if st == "free":
+    for aid, login, st, end, blocked, block_end in rows:
+        rows_data.append({"id": aid, "login": login, "status": st, "end": end, "blocked": blocked, "block_end": block_end})
+        if blocked:
+            block_dt = parse_iso_datetime(block_end)
+            if block_dt:
+                lines.append(f"🔒 {login} — {format_remaining_time(block_dt)} до конца блокировки")
+            else:
+                lines.append(f"🔒 {login} — блокировка Faceit")
+        elif st == "free":
             lines.append(f"🟢 {login}")
         else:
             try:
@@ -1111,15 +1453,14 @@ async def edit_enter_value(message: types.Message, state: FSMContext):
     await message.answer(f"Поле «{label}» обновлено.", reply_markup=detail_actions_kb())
     await message.answer(await build_account_details_text(row), reply_markup=detail_actions_kb())
 
-# ────────────────────────────────────────────────
-#  Статус
-# ────────────────────────────────────────────────
-
 @dp.message(F.text == "📊 Статус")
-async def show_status(message: types.Message):
+async def show_status(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
     clean_invalid_dates()
-    cursor.execute("SELECT COUNT(*) FROM accounts WHERE status='free'")
+    clean_expired_faceit_blocks()
+    await sync_faceit_bans(send_notifications=False)
+
+    cursor.execute("SELECT COUNT(*) FROM accounts WHERE status='free' AND COALESCE(faceit_blocked, 0) = 0")
     free = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM accounts WHERE status='busy'")
     busy = cursor.fetchone()[0]
@@ -1128,6 +1469,7 @@ async def show_status(message: types.Message):
         SELECT COUNT(*)
           FROM accounts
          WHERE status='free'
+           AND COALESCE(faceit_blocked, 0) = 0
            AND (
                 (faceit_url IS NOT NULL AND faceit_url != '')
                 OR (faceit_email IS NOT NULL AND faceit_email != '')
@@ -1136,12 +1478,71 @@ async def show_status(message: types.Message):
         """
     )
     free_faceit = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM accounts WHERE COALESCE(faceit_blocked, 0) = 1")
+    blocked_faceit = cursor.fetchone()[0]
+
+    await state.set_state(StatusMenu.menu)
     await message.answer(
         f"Свободных: {free}\n"
         f"Занятых: {busy}\n"
-        f"Свободных с Faceit: {free_faceit}",
-        reply_markup=main_menu
+        f"Свободных с Faceit: {free_faceit}\n"
+        f"Блокировок Faceit: {blocked_faceit}",
+        reply_markup=status_menu_kb()
     )
+
+
+@dp.message(StateFilter(StatusMenu.menu))
+async def status_menu_actions(message: types.Message, state: FSMContext):
+    txt = (message.text or "").strip().lower()
+
+    if txt == "назад":
+        await state.clear()
+        return await message.answer("Возврат в меню.", reply_markup=main_menu)
+
+    if txt == "проверка блокировок faceit":
+        clean_expired_faceit_blocks()
+        result = await sync_faceit_bans(send_notifications=True)
+
+        blocked_accounts = result.get("active_blocks", [])
+        errors = result.get("errors", [])
+        if not blocked_accounts:
+            if errors:
+                return await message.answer(
+                    "⚠️ Проверка блокировок Faceit не завершилась полностью:\n"
+                    + "\n".join(errors[:10]),
+                    reply_markup=status_menu_kb()
+                )
+            return await message.answer(
+                "✅ Все аккаунты без активных блокировок Faceit.",
+                reply_markup=status_menu_kb()
+            )
+
+        lines = [
+            f"🔒 Найдено блокировок Faceit: {len(blocked_accounts)}",
+            ""
+        ]
+        for block in blocked_accounts:
+            ends_at = block.get("ends_at")
+            ends_text = ends_at.astimezone().strftime("%d.%m.%Y %H:%M") if ends_at and ends_at.tzinfo else (ends_at.strftime("%d.%m.%Y %H:%M") if ends_at else "неизвестно")
+            lines.extend([
+                f"Аккаунт: {block.get('login')}",
+                f"Ник: {block.get('nickname')}",
+                f"Тип: {block.get('type')}",
+                f"Причина: {block.get('reason')}",
+                f"Срок блокировки: {format_remaining_time(ends_at)}",
+                f"До окончания: {ends_text}",
+                "",
+            ])
+
+        if errors:
+            lines.extend([
+                "⚠️ Не удалось проверить часть аккаунтов:",
+                *errors[:10],
+            ])
+
+        return await message.answer("\n".join(lines).rstrip(), reply_markup=status_menu_kb())
+
+    return await message.answer("Выберите действие из меню статуса.", reply_markup=status_menu_kb())
 
 # ────────────────────────────────────────────────
 #  Сдача в аренду
@@ -1151,8 +1552,18 @@ async def show_status(message: types.Message):
 async def rent_start(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
     clean_invalid_dates()
+    clean_expired_faceit_blocks()
+    await sync_faceit_bans(send_notifications=False)
 
-    cursor.execute("SELECT id, steam_login FROM accounts WHERE status='free' ORDER BY steam_login")
+    cursor.execute(
+        """
+        SELECT id, steam_login
+          FROM accounts
+         WHERE status='free'
+           AND COALESCE(faceit_blocked, 0) = 0
+         ORDER BY steam_login
+        """
+    )
     rows = cursor.fetchall()
     if not rows:
         return await message.answer("Нет свободных аккаунтов", reply_markup=main_menu)
@@ -1389,12 +1800,14 @@ async def extend_confirm(message: types.Message, state: FSMContext):
 # ────────────────────────────────────────────────
 
 async def checker_loop():
+    last_faceit_scan = 0.0
     while True:
         try:
             if DB_MAINTENANCE:
                 await asyncio.sleep(5)
                 continue
             clean_invalid_dates()
+            clean_expired_faceit_blocks()
             cursor.execute("SELECT id, steam_login, rent_end FROM accounts WHERE status='busy'")
             for row in cursor.fetchall():
                 try:
@@ -1410,6 +1823,14 @@ async def checker_loop():
                             await bot.send_message(admin_id, f"✅ {row[1]} освобождён автоматически")
                 except:
                     pass
+
+            now_ts = asyncio.get_running_loop().time()
+            if now_ts - last_faceit_scan >= 300:
+                scan_result = await sync_faceit_bans(send_notifications=True)
+                for notification in scan_result.get("notifications", []):
+                    for admin_id in ADMIN_IDS:
+                        await bot.send_message(admin_id, notification)
+                last_faceit_scan = now_ts
         except Exception as e:
             logging.error(f"checker_loop: {e}")
         await asyncio.sleep(30)
@@ -1421,6 +1842,7 @@ async def checker_loop():
 async def main():
     global FACEIT_API_KEY
     ensure_faceit_url_column()
+    ensure_faceit_block_columns()
     migrate_encryption()
     FACEIT_API_KEY = resolve_faceit_api_key()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
