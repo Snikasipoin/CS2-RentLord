@@ -1053,7 +1053,6 @@ async def show_accounts(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
     clean_invalid_dates()
     clean_expired_faceit_blocks()
-    await sync_faceit_bans(send_notifications=False)
 
     await render_accounts_list(message, state)
 
@@ -1458,7 +1457,6 @@ async def show_status(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
     clean_invalid_dates()
     clean_expired_faceit_blocks()
-    await sync_faceit_bans(send_notifications=False)
 
     cursor.execute("SELECT COUNT(*) FROM accounts WHERE status='free' AND COALESCE(faceit_blocked, 0) = 0")
     free = cursor.fetchone()[0]
@@ -1553,7 +1551,6 @@ async def rent_start(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
     clean_invalid_dates()
     clean_expired_faceit_blocks()
-    await sync_faceit_bans(send_notifications=False)
 
     cursor.execute(
         """
