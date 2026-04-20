@@ -674,7 +674,7 @@ async def fetch_faceit_player_details(player_id: str, api_key: str) -> dict:
             return await response.json()
 
 
-async def fetch_faceit_active_ban(faceit_url: str | None) -> dict:
+async def fetch_faceit_active_ban(faceit_url: str | None, api_key: str) -> dict:
     nickname = extract_faceit_nickname(faceit_url)
     if not nickname:
         return {"nickname": None, "player_id": None, "ban": None, "error": None}
@@ -683,12 +683,8 @@ async def fetch_faceit_active_ban(faceit_url: str | None) -> dict:
     if not player_id:
         return {"nickname": nickname, "player_id": None, "ban": None, "error": error or "Не удалось определить player_id"}
 
-    faceit_api_key = resolve_faceit_api_key()
-    if not faceit_api_key:
-        return {"nickname": nickname, "player_id": player_id, "ban": None, "error": "FACEIT_API_KEY не задан"}
-
     url = f"https://open.faceit.com/data/v4/players/{player_id}/bans"
-    headers = {"Authorization": f"Bearer {faceit_api_key}"}
+    headers = {"Authorization": f"Bearer {api_key}"}
     timeout = aiohttp.ClientTimeout(total=15)
 
     try:
@@ -749,7 +745,7 @@ async def sync_faceit_bans(send_notifications: bool = False) -> dict:
     updated_count = 0
 
     for aid, steam_login, faceit_url, faceit_blocked, faceit_block_ends_at, faceit_ban_signature in rows:
-        result = await fetch_faceit_active_ban(faceit_url)
+        result = await fetch_faceit_active_ban(faceit_url, api_key)
         error = result.get("error")
         ban = result.get("ban")
         now = datetime.now(timezone.utc)
