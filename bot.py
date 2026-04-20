@@ -5,7 +5,12 @@ import os
 import shutil
 import tempfile
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
+import base64
+import hashlib
+import hmac
+import struct
+import time
 
 import aiohttp
 from dotenv import load_dotenv, dotenv_values
@@ -203,6 +208,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     faceit_url      TEXT,
     faceit_email    TEXT,
     faceit_password TEXT,
+    faceit_2fa_secret TEXT,
     status          TEXT DEFAULT 'free',
     rent_end        TEXT
 )
@@ -239,6 +245,14 @@ def ensure_faceit_block_columns():
     if changed:
         conn.commit()
 
+
+def ensure_faceit_2fa_column():
+    cursor.execute("PRAGMA table_info(accounts)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "faceit_2fa_secret" not in columns:
+        cursor.execute("ALTER TABLE accounts ADD COLUMN faceit_2fa_secret TEXT")
+        conn.commit()
+
 def ensure_faceit_url_column():
     cursor.execute("PRAGMA table_info(accounts)")
     columns = {row[1] for row in cursor.fetchall()}
@@ -247,10 +261,10 @@ def ensure_faceit_url_column():
         conn.commit()
 
 def migrate_encryption():
-    cursor.execute("SELECT id, steam_password, email_password, faceit_password FROM accounts")
+    cursor.execute("SELECT id, steam_password, email_password, faceit_password, faceit_2fa_secret FROM accounts")
     updated = False
     for row in cursor.fetchall():
-        aid, sp, ep, fp = row
+        aid, sp, ep, fp, secret = row
         if sp and not sp.startswith("gAAAA"):
             cursor.execute("UPDATE accounts SET steam_password=? WHERE id=?", (encrypt(sp), aid))
             updated = True
@@ -259,6 +273,9 @@ def migrate_encryption():
             updated = True
         if fp and not fp.startswith("gAAAA"):
             cursor.execute("UPDATE accounts SET faceit_password=? WHERE id=?", (encrypt(fp), aid))
+            updated = True
+        if secret and not secret.startswith("gAAAA"):
+            cursor.execute("UPDATE accounts SET faceit_2fa_secret=? WHERE id=?", (encrypt(secret), aid))
             updated = True
     if updated:
         conn.commit()
@@ -411,7 +428,8 @@ def get_account_by_id(aid: int):
                faceit_block_type,
                faceit_block_game,
                faceit_ban_signature,
-               faceit_block_last_checked_at
+               faceit_block_last_checked_at,
+               faceit_2fa_secret
           FROM accounts
          WHERE id = ?
         """,
@@ -524,6 +542,45 @@ def format_remaining_time(end_at: datetime | None) -> str:
         parts.append(f"{minutes}м")
 
     return " ".join(parts) if parts else "0м"
+
+
+def normalize_totp_secret(raw_value: str | None) -> str | None:
+    if not raw_value:
+        return None
+
+    value = raw_value.strip()
+    if not value:
+        return None
+
+    if value.lower().startswith("otpauth://"):
+        parsed = urlparse(value)
+        query = parse_qs(parsed.query)
+        secret_values = query.get("secret") or []
+        if secret_values:
+            value = secret_values[0].strip()
+
+    value = value.replace(" ", "").replace("-", "").upper()
+    return value or None
+
+
+def generate_totp_code(secret: str, period: int = 30, digits: int = 6) -> tuple[str, int]:
+    normalized = normalize_totp_secret(secret)
+    if not normalized:
+        raise ValueError("Пустой secret")
+
+    padding = "=" * (-len(normalized) % 8)
+    key = base64.b32decode(normalized + padding, casefold=True)
+
+    counter = int(time.time()) // period
+    msg = struct.pack(">Q", counter)
+    digest = hmac.new(key, msg, hashlib.sha1).digest()
+
+    offset = digest[-1] & 0x0F
+    code_int = (struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    code = f"{code_int:0{digits}d}"
+
+    seconds_left = period - (int(time.time()) % period)
+    return code, seconds_left
 
 
 async def resolve_faceit_player_id(faceit_url: str | None) -> tuple[str | None, str | None]:
@@ -713,6 +770,7 @@ async def build_account_details_text(row) -> str:
     faceit_block_ends_at = rest[1] if len(rest) > 1 else None
     faceit_block_reason = rest[2] if len(rest) > 2 else None
     faceit_block_type = rest[3] if len(rest) > 3 else None
+    faceit_2fa_secret = rest[7] if len(rest) > 7 else None
 
     details_lines = [
         f"Данные аккаунта: {s_login}",
@@ -727,7 +785,7 @@ async def build_account_details_text(row) -> str:
         f"  Пароль: {e_pw or '-'}",
     ]
 
-    if f_url or f_email or f_pw_enc:
+    if f_url or f_email or f_pw_enc or faceit_2fa_secret:
         faceit_stats = await fetch_faceit_profile_stats(f_url)
         details_lines.extend([
             "",
@@ -744,6 +802,8 @@ async def build_account_details_text(row) -> str:
         else:
             reason = faceit_stats["error"] or "не удалось получить"
             details_lines.append(f"  Elo: недоступно ({reason})")
+
+        details_lines.append(f"  2FA: {'подключена' if faceit_2fa_secret else 'не настроена'}")
 
     block_dt = parse_iso_datetime(faceit_block_ends_at)
     if faceit_blocked and block_dt:
@@ -779,7 +839,8 @@ async def build_account_details_text(row) -> str:
 def detail_actions_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="Редактировать"), KeyboardButton(text="Удалить")],
+            [KeyboardButton(text="Редактировать"), KeyboardButton(text="2FA код")],
+            [KeyboardButton(text="Удалить")],
             [KeyboardButton(text="Назад")],
         ],
         resize_keyboard=True
@@ -824,7 +885,7 @@ def edit_fields_kb() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="Steam логин"), KeyboardButton(text="Steam пароль")],
             [KeyboardButton(text="Email"), KeyboardButton(text="Пароль email")],
             [KeyboardButton(text="Faceit ссылка"), KeyboardButton(text="Faceit email")],
-            [KeyboardButton(text="Пароль Faceit")],
+            [KeyboardButton(text="Пароль Faceit"), KeyboardButton(text="Faceit 2FA secret")],
             [KeyboardButton(text="Назад")],
         ],
         resize_keyboard=True
@@ -1130,14 +1191,43 @@ async def account_detail_action(message: types.Message, state: FSMContext):
     txt = (message.text or "").strip().lower()
     data = await state.get_data()
     aid = data.get("selected_id")
+    row = get_account_by_id(aid) if aid else None
 
     if txt == "назад":
         await state.clear()
         return await render_accounts_list(message, state)
 
+    if txt == "2fa код":
+        if not row:
+            await state.clear()
+            return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+        secret = row[-1]
+        if not secret:
+            return await message.answer(
+                "Для этого аккаунта не сохранён Faceit 2FA secret.\n"
+                "Сначала добавьте его в поле «Faceit 2FA secret».",
+                reply_markup=detail_actions_kb()
+            )
+
+        try:
+            code, seconds_left = generate_totp_code(decrypt(secret))
+        except Exception as e:
+            logging.error(f"2fa code error: {e}")
+            return await message.answer(
+                "Не удалось сгенерировать код. Проверьте, что secret введён корректно.",
+                reply_markup=detail_actions_kb()
+            )
+
+        return await message.answer(
+            f"Faceit 2FA код для {row[0]}:\n"
+            f"{code}\n"
+            f"Код обновится через {seconds_left} сек.",
+            reply_markup=detail_actions_kb()
+        )
+
     if txt != "редактировать":
         if txt == "удалить":
-            row = get_account_by_id(aid) if aid else None
             if not row:
                 await state.clear()
                 return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
@@ -1381,6 +1471,7 @@ async def edit_choose_field(message: types.Message, state: FSMContext):
         "faceit ссылка": ("faceit_url", "Faceit ссылка", True),
         "faceit email": ("faceit_email", "Faceit email", True),
         "пароль faceit": ("faceit_password", "Пароль Faceit", True),
+        "faceit 2fa secret": ("faceit_2fa_secret", "Faceit 2FA secret", True),
     }
     field = field_map.get(txt)
     if field is None:
@@ -1425,7 +1516,7 @@ async def edit_enter_value(message: types.Message, state: FSMContext):
         if cursor.fetchone():
             return await message.answer("Такой Steam логин уже существует.", reply_markup=cancel_kb)
 
-    stored_value = encrypt(new_value) if field in {"steam_password", "email_password", "faceit_password"} and new_value is not None else new_value
+    stored_value = encrypt(new_value) if field in {"steam_password", "email_password", "faceit_password", "faceit_2fa_secret"} and new_value is not None else new_value
 
     try:
         cursor.execute(f"UPDATE accounts SET {field} = ? WHERE id = ?", (stored_value, aid))
@@ -1840,6 +1931,7 @@ async def main():
     global FACEIT_API_KEY
     ensure_faceit_url_column()
     ensure_faceit_block_columns()
+    ensure_faceit_2fa_column()
     migrate_encryption()
     FACEIT_API_KEY = resolve_faceit_api_key()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
