@@ -607,6 +607,73 @@ async def resolve_faceit_player_id(faceit_url: str | None) -> tuple[str | None, 
     return stats.get("player_id"), stats.get("error")
 
 
+def normalize_faceit_ban_item(item: dict, player_id: str | None, nickname: str) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+
+    ends_at = parse_faceit_ban_end(item)
+    starts_at = parse_faceit_ban_start(item)
+    expired = item.get("expired")
+
+    if expired is True:
+        return None
+
+    now = datetime.now(timezone.utc)
+    if ends_at is None:
+        return None
+    if ends_at is not None and ends_at <= now:
+        return None
+
+    ban_id = item.get("banId") or item.get("ban_id") or item.get("id") or ""
+    return {
+        "ban_id": str(ban_id),
+        "game": item.get("game") or "",
+        "nickname": item.get("nickname") or nickname,
+        "reason": item.get("reason") or "",
+        "type": item.get("type") or "",
+        "starts_at": starts_at,
+        "ends_at": ends_at,
+        "user_id": item.get("user_id") or item.get("userId") or player_id,
+    }
+
+
+def extract_active_bans_from_payload(payload: dict, player_id: str | None, nickname: str) -> list[dict]:
+    active_bans: list[dict] = []
+
+    items = payload.get("items")
+    if isinstance(items, list):
+        for item in items:
+            normalized = normalize_faceit_ban_item(item, player_id, nickname)
+            if normalized is not None:
+                active_bans.append(normalized)
+
+    infractions = payload.get("infractions")
+    if isinstance(infractions, dict):
+        infractions_items = infractions.get("items")
+    else:
+        infractions_items = infractions
+
+    if isinstance(infractions_items, list):
+        for item in infractions_items:
+            normalized = normalize_faceit_ban_item(item, player_id, nickname)
+            if normalized is not None:
+                active_bans.append(normalized)
+
+    return active_bans
+
+
+async def fetch_faceit_player_details(player_id: str, api_key: str) -> dict:
+    url = f"https://open.faceit.com/data/v4/players/{player_id}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    timeout = aiohttp.ClientTimeout(total=15)
+
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        async with session.get(url) as response:
+            if response.status != 200:
+                raise RuntimeError(f"HTTP {response.status}")
+            return await response.json()
+
+
 async def fetch_faceit_active_ban(faceit_url: str | None) -> dict:
     nickname = extract_faceit_nickname(faceit_url)
     if not nickname:
@@ -638,27 +705,14 @@ async def fetch_faceit_active_ban(faceit_url: str | None) -> dict:
     except Exception as e:
         return {"nickname": nickname, "player_id": player_id, "ban": None, "error": str(e)}
 
-    now = datetime.now(timezone.utc)
-    active_bans = []
-    for item in data.get("items", []):
-        ends_at = parse_faceit_ban_end(item)
-        starts_at = parse_faceit_ban_start(item)
-        expired = item.get("expired")
+    active_bans = extract_active_bans_from_payload(data, player_id, nickname)
 
-        if expired is True:
-            continue
-        if ends_at is not None and ends_at <= now:
-            continue
-        active_bans.append({
-            "ban_id": item.get("banId") or item.get("ban_id") or "",
-            "game": item.get("game") or "",
-            "nickname": item.get("nickname") or nickname,
-            "reason": item.get("reason") or "",
-            "type": item.get("type") or "",
-            "starts_at": starts_at,
-            "ends_at": ends_at,
-            "user_id": item.get("user_id") or item.get("userId") or player_id,
-        })
+    if not active_bans:
+        try:
+            player_payload = await fetch_faceit_player_details(player_id, api_key)
+            active_bans = extract_active_bans_from_payload(player_payload, player_id, nickname)
+        except Exception as e:
+            return {"nickname": nickname, "player_id": player_id, "ban": None, "error": str(e)}
 
     if not active_bans:
         return {"nickname": nickname, "player_id": player_id, "ban": None, "error": None}
