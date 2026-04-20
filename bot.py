@@ -514,9 +514,28 @@ def parse_iso_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
         return None
+
+
+def parse_faceit_ban_end(item: dict) -> datetime | None:
+    for key in ("ends_at", "banEnd", "ban_end", "endsAt"):
+        dt = parse_iso_datetime(item.get(key))
+        if dt is not None:
+            return dt
+    return None
+
+
+def parse_faceit_ban_start(item: dict) -> datetime | None:
+    for key in ("starts_at", "banStart", "ban_start", "startsAt"):
+        dt = parse_iso_datetime(item.get(key))
+        if dt is not None:
+            return dt
+    return None
 
 
 def format_remaining_time(end_at: datetime | None) -> str:
@@ -622,9 +641,13 @@ async def fetch_faceit_active_ban(faceit_url: str | None) -> dict:
     now = datetime.now(timezone.utc)
     active_bans = []
     for item in data.get("items", []):
-        ends_at = parse_iso_datetime(item.get("ends_at"))
-        starts_at = parse_iso_datetime(item.get("starts_at"))
-        if ends_at is None or ends_at <= now:
+        ends_at = parse_faceit_ban_end(item)
+        starts_at = parse_faceit_ban_start(item)
+        expired = item.get("expired")
+
+        if expired is True:
+            continue
+        if ends_at is not None and ends_at <= now:
             continue
         active_bans.append({
             "ban_id": item.get("banId") or item.get("ban_id") or "",
@@ -634,7 +657,7 @@ async def fetch_faceit_active_ban(faceit_url: str | None) -> dict:
             "type": item.get("type") or "",
             "starts_at": starts_at,
             "ends_at": ends_at,
-            "user_id": item.get("user_id") or player_id,
+            "user_id": item.get("user_id") or item.get("userId") or player_id,
         })
 
     if not active_bans:
