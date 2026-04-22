@@ -253,6 +253,14 @@ def ensure_faceit_2fa_column():
         cursor.execute("ALTER TABLE accounts ADD COLUMN faceit_2fa_secret TEXT")
         conn.commit()
 
+
+def ensure_steam_shared_secret_column():
+    cursor.execute("PRAGMA table_info(accounts)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "steam_shared_secret" not in columns:
+        cursor.execute("ALTER TABLE accounts ADD COLUMN steam_shared_secret TEXT")
+        conn.commit()
+
 def ensure_faceit_url_column():
     cursor.execute("PRAGMA table_info(accounts)")
     columns = {row[1] for row in cursor.fetchall()}
@@ -261,10 +269,10 @@ def ensure_faceit_url_column():
         conn.commit()
 
 def migrate_encryption():
-    cursor.execute("SELECT id, steam_password, email_password, faceit_password, faceit_2fa_secret FROM accounts")
+    cursor.execute("SELECT id, steam_password, email_password, faceit_password, faceit_2fa_secret, steam_shared_secret FROM accounts")
     updated = False
     for row in cursor.fetchall():
-        aid, sp, ep, fp, secret = row
+        aid, sp, ep, fp, secret, steam_secret = row
         if sp and not sp.startswith("gAAAA"):
             cursor.execute("UPDATE accounts SET steam_password=? WHERE id=?", (encrypt(sp), aid))
             updated = True
@@ -276,6 +284,9 @@ def migrate_encryption():
             updated = True
         if secret and not secret.startswith("gAAAA"):
             cursor.execute("UPDATE accounts SET faceit_2fa_secret=? WHERE id=?", (encrypt(secret), aid))
+            updated = True
+        if steam_secret and not steam_secret.startswith("gAAAA"):
+            cursor.execute("UPDATE accounts SET steam_shared_secret=? WHERE id=?", (encrypt(steam_secret), aid))
             updated = True
     if updated:
         conn.commit()
@@ -429,7 +440,8 @@ def get_account_by_id(aid: int):
                faceit_block_game,
                faceit_ban_signature,
                faceit_block_last_checked_at,
-               faceit_2fa_secret
+               faceit_2fa_secret,
+               steam_shared_secret
           FROM accounts
          WHERE id = ?
         """,
@@ -520,6 +532,40 @@ def parse_iso_datetime(value: str | None) -> datetime | None:
         return dt
     except Exception:
         return None
+
+
+def normalize_steam_secret(raw_value: str | None) -> str | None:
+    if not raw_value:
+        return None
+
+    value = raw_value.strip()
+    if not value:
+        return None
+
+    return value.replace(" ", "")
+
+
+def generate_steam_guard_code(shared_secret: str) -> tuple[str, int]:
+    normalized = normalize_steam_secret(shared_secret)
+    if not normalized:
+        raise ValueError("Пустой Steam shared_secret")
+
+    padding = "=" * (-len(normalized) % 4)
+    secret = base64.b64decode(normalized + padding)
+
+    time_buffer = struct.pack(">Q", int(time.time() / 30))
+    digest = hmac.new(secret, time_buffer, hashlib.sha1).digest()
+
+    start = digest[19] & 0x0F
+    full_code = struct.unpack(">I", digest[start:start + 4])[0] & 0x7FFFFFFF
+    alphabet = "23456789BCDFGHJKMNPQRTVWXY"
+    code_chars = []
+    for _ in range(5):
+        code_chars.append(alphabet[full_code % len(alphabet)])
+        full_code //= len(alphabet)
+    code = "".join(code_chars)
+    seconds_left = 30 - (int(time.time()) % 30)
+    return code, seconds_left
 
 
 def parse_faceit_ban_end(item: dict) -> datetime | None:
@@ -844,6 +890,7 @@ async def build_account_details_text(row) -> str:
     faceit_block_reason = rest[2] if len(rest) > 2 else None
     faceit_block_type = rest[3] if len(rest) > 3 else None
     faceit_2fa_secret = rest[7] if len(rest) > 7 else None
+    steam_shared_secret = rest[8] if len(rest) > 8 else None
 
     details_lines = [
         f"Данные аккаунта: {s_login}",
@@ -877,6 +924,12 @@ async def build_account_details_text(row) -> str:
             details_lines.append(f"  Elo: недоступно ({reason})")
 
         details_lines.append(f"  2FA: {'подключена' if faceit_2fa_secret else 'не настроена'}")
+
+    details_lines.extend([
+        "",
+        "Steam Guard:",
+        f"  Статус: {'подключён' if steam_shared_secret else 'не настроен'}",
+    ])
 
     block_dt = parse_iso_datetime(faceit_block_ends_at)
     if faceit_blocked and block_dt:
@@ -912,7 +965,8 @@ async def build_account_details_text(row) -> str:
 def detail_actions_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="Редактировать"), KeyboardButton(text="2FA код")],
+            [KeyboardButton(text="Редактировать"), KeyboardButton(text="Steam код")],
+            [KeyboardButton(text="2FA код")],
             [KeyboardButton(text="Удалить")],
             [KeyboardButton(text="Назад")],
         ],
@@ -959,6 +1013,7 @@ def edit_fields_kb() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="Email"), KeyboardButton(text="Пароль email")],
             [KeyboardButton(text="Faceit ссылка"), KeyboardButton(text="Faceit email")],
             [KeyboardButton(text="Пароль Faceit"), KeyboardButton(text="Faceit 2FA secret")],
+            [KeyboardButton(text="Steam shared secret")],
             [KeyboardButton(text="Назад")],
         ],
         resize_keyboard=True
@@ -1265,18 +1320,47 @@ async def account_detail_action(message: types.Message, state: FSMContext):
     data = await state.get_data()
     aid = data.get("selected_id")
     row = get_account_by_id(aid) if aid else None
+    faceit_2fa_secret = row[-2] if row and len(row) >= 2 else None
+    steam_shared_secret = row[-1] if row else None
 
     if txt == "назад":
         await state.clear()
         return await render_accounts_list(message, state)
+
+    if txt == "steam код":
+        if not row:
+            await state.clear()
+            return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+        if not steam_shared_secret:
+            return await message.answer(
+                "Для этого аккаунта не сохранён Steam shared secret.\n"
+                "Сначала добавьте его в поле «Steam shared secret».",
+                reply_markup=detail_actions_kb()
+            )
+
+        try:
+            code, seconds_left = generate_steam_guard_code(decrypt(steam_shared_secret))
+        except Exception as e:
+            logging.error(f"steam code error: {e}")
+            return await message.answer(
+                "Не удалось сгенерировать Steam код. Проверьте, что shared secret введён корректно.",
+                reply_markup=detail_actions_kb()
+            )
+
+        return await message.answer(
+            f"Steam Guard код для {row[0]}:\n"
+            f"{code}\n"
+            f"Код обновится через {seconds_left} сек.",
+            reply_markup=detail_actions_kb()
+        )
 
     if txt == "2fa код":
         if not row:
             await state.clear()
             return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
 
-        secret = row[-1]
-        if not secret:
+        if not faceit_2fa_secret:
             return await message.answer(
                 "Для этого аккаунта не сохранён Faceit 2FA secret.\n"
                 "Сначала добавьте его в поле «Faceit 2FA secret».",
@@ -1284,7 +1368,7 @@ async def account_detail_action(message: types.Message, state: FSMContext):
             )
 
         try:
-            code, seconds_left = generate_totp_code(decrypt(secret))
+            code, seconds_left = generate_totp_code(decrypt(faceit_2fa_secret))
         except Exception as e:
             logging.error(f"2fa code error: {e}")
             return await message.answer(
@@ -1545,6 +1629,7 @@ async def edit_choose_field(message: types.Message, state: FSMContext):
         "faceit email": ("faceit_email", "Faceit email", True),
         "пароль faceit": ("faceit_password", "Пароль Faceit", True),
         "faceit 2fa secret": ("faceit_2fa_secret", "Faceit 2FA secret", True),
+        "steam shared secret": ("steam_shared_secret", "Steam shared secret", True),
     }
     field = field_map.get(txt)
     if field is None:
@@ -1589,7 +1674,7 @@ async def edit_enter_value(message: types.Message, state: FSMContext):
         if cursor.fetchone():
             return await message.answer("Такой Steam логин уже существует.", reply_markup=cancel_kb)
 
-    stored_value = encrypt(new_value) if field in {"steam_password", "email_password", "faceit_password", "faceit_2fa_secret"} and new_value is not None else new_value
+    stored_value = encrypt(new_value) if field in {"steam_password", "email_password", "faceit_password", "faceit_2fa_secret", "steam_shared_secret"} and new_value is not None else new_value
 
     try:
         cursor.execute(f"UPDATE accounts SET {field} = ? WHERE id = ?", (stored_value, aid))
@@ -2005,6 +2090,7 @@ async def main():
     ensure_faceit_url_column()
     ensure_faceit_block_columns()
     ensure_faceit_2fa_column()
+    ensure_steam_shared_secret_column()
     migrate_encryption()
     FACEIT_API_KEY = resolve_faceit_api_key()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
