@@ -22,6 +22,11 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
+try:
+    from FunPayAPI import Account as FunPayAccount
+except Exception:
+    FunPayAccount = None
+
 # ────────────────────────────────────────────────
 #  Настройки и шифрование
 # ────────────────────────────────────────────────
@@ -190,6 +195,82 @@ def resolve_faceit_api_key() -> str:
     key, _ = resolve_faceit_api_key_with_source()
     return key
 
+
+def get_funpay_golden_key_from_storage() -> str:
+    raw_value = get_setting_raw("funpay_golden_key")
+    if raw_value:
+        try:
+            return decrypt(raw_value) or ""
+        except Exception:
+            return ""
+    return ""
+
+
+def set_funpay_golden_key(value: str | None) -> None:
+    if value is None or not value.strip():
+        set_setting_raw("funpay_golden_key", None)
+        logging.info("FunPay golden key removed from settings")
+    else:
+        set_setting_raw("funpay_golden_key", encrypt(value.strip()))
+        logging.info("FunPay golden key updated in settings")
+
+
+def resolve_funpay_golden_key() -> str:
+    return get_funpay_golden_key_from_storage()
+
+
+def get_funpay_user_agent_from_storage() -> str:
+    raw_value = get_setting_raw("funpay_user_agent")
+    if raw_value:
+        try:
+            return decrypt(raw_value) or ""
+        except Exception:
+            return ""
+    return ""
+
+
+def set_funpay_user_agent(value: str | None) -> None:
+    if value is None or not value.strip():
+        set_setting_raw("funpay_user_agent", None)
+        logging.info("FunPay user-agent removed from settings")
+    else:
+        set_setting_raw("funpay_user_agent", encrypt(value.strip()))
+        logging.info("FunPay user-agent updated in settings")
+
+
+def resolve_funpay_user_agent() -> str:
+    return get_funpay_user_agent_from_storage()
+
+
+def get_funpay_auto_raise_enabled() -> bool:
+    value = (get_setting_raw("funpay_auto_raise_enabled") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def set_funpay_auto_raise_enabled(enabled: bool) -> None:
+    set_setting_raw("funpay_auto_raise_enabled", "1" if enabled else "0")
+
+
+def funpay_toggle_auto_raise() -> bool:
+    new_value = not get_funpay_auto_raise_enabled()
+    set_funpay_auto_raise_enabled(new_value)
+    logging.info("FunPay auto raise toggled to %s", new_value)
+    return new_value
+
+
+def funpay_ensure_available() -> None:
+    if FunPayAccount is None:
+        raise RuntimeError(
+            "Библиотека FunPayAPI не установлена. Установите пакет `FunPayAPI`."
+        )
+
+
+def get_funpay_op_lock() -> asyncio.Lock:
+    global FUNPAY_OP_LOCK
+    if FUNPAY_OP_LOCK is None:
+        FUNPAY_OP_LOCK = asyncio.Lock()
+    return FUNPAY_OP_LOCK
+
 # ────────────────────────────────────────────────
 #  База данных
 # ────────────────────────────────────────────────
@@ -197,6 +278,9 @@ def resolve_faceit_api_key() -> str:
 conn = sqlite3.connect("accounts.db", check_same_thread=False)
 cursor = conn.cursor()
 DB_MAINTENANCE = False
+FUNPAY_OP_LOCK: asyncio.Lock | None = None
+FUNPAY_AUTO_RAISE_LAST_RUN = 0.0
+FUNPAY_AUTO_RAISE_INTERVAL_SECONDS = 3600
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS accounts (
@@ -334,6 +418,13 @@ class DataBackup(StatesGroup):
     restore_wait_file = State()
     faceit_api_menu = State()
     faceit_api_wait_key = State()
+    funpay_menu = State()
+    funpay_wait_key = State()
+    funpay_wait_user_agent = State()
+
+
+class FunPayMenu(StatesGroup):
+    menu = State()
 
 
 class StatusMenu(StatesGroup):
@@ -355,7 +446,8 @@ main_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Статус"),     KeyboardButton(text="📦 Аккаунты")],
         [KeyboardButton(text="➕ Добавить"),    KeyboardButton(text="🎮 Сдать")],
-        [KeyboardButton(text="⏱ Продлить"),    KeyboardButton(text="✅ Освободить")],
+        [KeyboardButton(text="🎯 FunPay"),      KeyboardButton(text="⏱ Продлить")],
+        [KeyboardButton(text="✅ Освободить")],
         [KeyboardButton(text="💾 Данные")]
     ],
     resize_keyboard=True
@@ -763,6 +855,74 @@ async def fetch_faceit_active_ban(faceit_url: str | None, api_key: str) -> dict:
     return {"nickname": nickname, "player_id": player_id, "ban": active_bans[-1], "error": None}
 
 
+def _funpay_build_account_sync(golden_key: str, user_agent: str | None = None):
+    funpay_ensure_available()
+    acc = FunPayAccount(golden_key, user_agent=user_agent or None)
+    acc.get()
+    return acc
+
+
+def _funpay_fetch_balance_sync(golden_key: str, user_agent: str | None = None) -> dict:
+    acc = _funpay_build_account_sync(golden_key, user_agent)
+    balance = acc.get_balance()
+    return {
+        "username": getattr(acc, "username", None),
+        "id": getattr(acc, "id", None),
+        "balance": balance,
+    }
+
+
+def _funpay_raise_all_lots_sync(golden_key: str, user_agent: str | None = None) -> dict:
+    acc = _funpay_build_account_sync(golden_key, user_agent)
+    categories = acc.get_sorted_categories() or {}
+
+    raised = []
+    errors = []
+    for category_id, category in categories.items():
+        try:
+            result = acc.raise_lots(category_id)
+            raised.append({
+                "category_id": category_id,
+                "category_name": getattr(category, "name", str(category_id)),
+                "result": result,
+            })
+        except Exception as e:
+            errors.append(f"{getattr(category, 'name', category_id)}: {e}")
+
+    return {
+        "username": getattr(acc, "username", None),
+        "id": getattr(acc, "id", None),
+        "raised": raised,
+        "errors": errors,
+    }
+
+
+async def funpay_get_balance() -> dict:
+    golden_key = resolve_funpay_golden_key()
+    if not golden_key:
+        return {"error": "FunPay golden key не задан"}
+
+    user_agent = resolve_funpay_user_agent()
+    async with get_funpay_op_lock():
+        try:
+            return await asyncio.to_thread(_funpay_fetch_balance_sync, golden_key, user_agent)
+        except Exception as e:
+            return {"error": str(e)}
+
+
+async def funpay_raise_all_lots() -> dict:
+    golden_key = resolve_funpay_golden_key()
+    if not golden_key:
+        return {"error": "FunPay golden key не задан"}
+
+    user_agent = resolve_funpay_user_agent()
+    async with get_funpay_op_lock():
+        try:
+            return await asyncio.to_thread(_funpay_raise_all_lots_sync, golden_key, user_agent)
+        except Exception as e:
+            return {"error": str(e)}
+
+
 async def sync_faceit_bans(send_notifications: bool = False) -> dict:
     api_key = resolve_faceit_api_key()
     if not api_key:
@@ -988,6 +1148,7 @@ def data_menu_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="Создать копию"), KeyboardButton(text="Загрузить копию")],
             [KeyboardButton(text="FACEIT API")],
+            [KeyboardButton(text="FUNPAY")],
             [KeyboardButton(text="Назад")],
         ],
         resize_keyboard=True
@@ -999,6 +1160,38 @@ def faceit_api_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="Ввести/обновить ключ")],
             [KeyboardButton(text="Удалить ключ")],
+            [KeyboardButton(text="Назад")],
+        ],
+        resize_keyboard=True
+    )
+
+
+def funpay_api_kb() -> ReplyKeyboardMarkup:
+    key_status = "изменить" if resolve_funpay_golden_key() else "ввести"
+    ua_status = "изменить" if resolve_funpay_user_agent() else "ввести"
+
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=f"{key_status.title()} Golden Key")],
+            [KeyboardButton(text=f"{ua_status.title()} User-Agent")],
+            [KeyboardButton(text="Назад")],
+        ],
+        resize_keyboard=True
+    )
+
+
+def funpay_settings_kb() -> ReplyKeyboardMarkup:
+    key_status = "изменить" if resolve_funpay_golden_key() else "ввести"
+    ua_status = "изменить" if resolve_funpay_user_agent() else "ввести"
+    auto_status = "выключен"
+    if get_funpay_auto_raise_enabled():
+        auto_status = "включён"
+
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Баланс FunPay")],
+            [KeyboardButton(text=f"Автоподъём: {auto_status}")],
+            [KeyboardButton(text=f"{key_status.title()} Golden Key"), KeyboardButton(text=f"{ua_status.title()} User-Agent")],
             [KeyboardButton(text="Назад")],
         ],
         resize_keyboard=True
@@ -1518,6 +1711,16 @@ async def data_choose_action(message: types.Message, state: FSMContext):
             reply_markup=faceit_api_kb()
         )
 
+    if txt == "funpay":
+        golden_key = resolve_funpay_golden_key()
+        status_text = "установлен" if golden_key else "не установлен"
+        await state.update_data(funpay_return_state="data")
+        await state.set_state(DataBackup.funpay_menu)
+        return await message.answer(
+            f"FunPay Golden Key: {status_text}.",
+            reply_markup=funpay_api_kb()
+        )
+
     return await message.answer("Выберите действие из меню.", reply_markup=data_menu_kb())
 
 
@@ -1599,6 +1802,83 @@ async def faceit_api_wait_key(message: types.Message, state: FSMContext):
     FACEIT_API_KEY = resolve_faceit_api_key()
     await state.set_state(DataBackup.faceit_api_menu)
     await message.answer("FACEIT API ключ сохранён и активирован.", reply_markup=faceit_api_kb())
+
+
+@dp.message(StateFilter(DataBackup.funpay_menu))
+async def funpay_data_menu(message: types.Message, state: FSMContext):
+    txt = (message.text or "").strip().lower()
+
+    if txt == "назад":
+        await state.clear()
+        return await message.answer("Возврат в меню.", reply_markup=main_menu)
+
+    if txt == "ввести golden key" or txt == "изменить golden key":
+        await state.update_data(funpay_return_state="data")
+        await state.set_state(DataBackup.funpay_wait_key)
+        return await message.answer(
+            "Отправьте FunPay Golden Key одним сообщением.",
+            reply_markup=cancel_kb
+        )
+
+    if txt == "ввести user-agent" or txt == "изменить user-agent":
+        await state.update_data(funpay_return_state="data")
+        await state.set_state(DataBackup.funpay_wait_user_agent)
+        return await message.answer(
+            "Отправьте FunPay User-Agent одним сообщением.",
+            reply_markup=cancel_kb
+        )
+
+    return await message.answer("Выберите действие из меню FunPay.", reply_markup=funpay_api_kb())
+
+
+@dp.message(StateFilter(DataBackup.funpay_wait_key))
+async def funpay_wait_key(message: types.Message, state: FSMContext):
+    key = (message.text or "").strip()
+    data = await state.get_data()
+    return_state = data.get("funpay_return_state") or "funpay"
+
+    if key.lower() == "отмена":
+        if return_state == "data":
+            await state.set_state(DataBackup.funpay_menu)
+            return await message.answer("Ввод ключа отменён.", reply_markup=funpay_api_kb())
+        await state.set_state(FunPayMenu.menu)
+        return await message.answer("Ввод ключа отменён.", reply_markup=funpay_settings_kb())
+
+    if not key:
+        return await message.answer("Ключ не может быть пустым.", reply_markup=cancel_kb)
+
+    set_funpay_golden_key(key)
+    if return_state == "data":
+        await state.set_state(DataBackup.funpay_menu)
+        await message.answer("FunPay Golden Key сохранён.", reply_markup=funpay_api_kb())
+    else:
+        await state.set_state(FunPayMenu.menu)
+        await message.answer("FunPay Golden Key сохранён.", reply_markup=funpay_settings_kb())
+
+
+@dp.message(StateFilter(DataBackup.funpay_wait_user_agent))
+async def funpay_wait_user_agent(message: types.Message, state: FSMContext):
+    value = (message.text or "").strip()
+    data = await state.get_data()
+    return_state = data.get("funpay_return_state") or "funpay"
+
+    if value.lower() == "отмена":
+        if return_state == "data":
+            await state.set_state(DataBackup.funpay_menu)
+            return await message.answer("Ввод User-Agent отменён.", reply_markup=funpay_api_kb())
+        await state.set_state(FunPayMenu.menu)
+        return await message.answer("Ввод User-Agent отменён.", reply_markup=funpay_settings_kb())
+
+    if not value:
+        return await message.answer("User-Agent не может быть пустым.", reply_markup=cancel_kb)
+
+    set_funpay_user_agent(value)
+    if return_state == "data":
+        await state.set_state(DataBackup.funpay_menu)
+        await message.answer("FunPay User-Agent сохранён.", reply_markup=funpay_api_kb())
+    else:
+        await state.set_state(FunPayMenu.menu)
+        await message.answer("FunPay User-Agent сохранён.", reply_markup=funpay_settings_kb())
 
 
 @dp.message(StateFilter(EditAccount.choose_field))
@@ -1789,6 +2069,86 @@ async def status_menu_actions(message: types.Message, state: FSMContext):
         return await message.answer("\n".join(lines).rstrip(), reply_markup=status_menu_kb())
 
     return await message.answer("Выберите действие из меню статуса.", reply_markup=status_menu_kb())
+
+
+# ────────────────────────────────────────────────
+#  FunPay
+# ────────────────────────────────────────────────
+
+
+def funpay_status_text() -> str:
+    golden_key = resolve_funpay_golden_key()
+    user_agent = resolve_funpay_user_agent()
+    auto_raise = "включён" if get_funpay_auto_raise_enabled() else "выключен"
+    return (
+        f"FunPayAPI: {'установлена' if FunPayAccount else 'не установлена'}\n"
+        f"FunPay Golden Key: {'установлен' if golden_key else 'не установлен'}\n"
+        f"FunPay User-Agent: {'установлен' if user_agent else 'не установлен'}\n"
+        f"Автоподъём лотов: {auto_raise}"
+    )
+
+
+@dp.message(F.text == "🎯 FunPay")
+async def funpay_root(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    await state.clear()
+    await state.set_state(FunPayMenu.menu)
+    await message.answer(funpay_status_text(), reply_markup=funpay_settings_kb())
+
+
+@dp.message(StateFilter(FunPayMenu.menu))
+async def funpay_menu_actions(message: types.Message, state: FSMContext):
+    txt = (message.text or "").strip().lower()
+
+    if txt == "назад":
+        await state.clear()
+        return await message.answer("Возврат в меню.", reply_markup=main_menu)
+
+    if txt in {"баланс funpay", "баланс"}:
+        result = await funpay_get_balance()
+        if result.get("error"):
+            return await message.answer(
+                f"Не удалось получить баланс FunPay: {result['error']}",
+                reply_markup=funpay_settings_kb()
+            )
+
+        balance = result["balance"]
+        username = result.get("username") or "-"
+        text = (
+            f"FunPay аккаунт: {username}\n"
+            f"RUB: всего {balance.total_rub:.2f}, доступно {balance.available_rub:.2f}\n"
+            f"USD: всего {balance.total_usd:.2f}, доступно {balance.available_usd:.2f}\n"
+            f"EUR: всего {balance.total_eur:.2f}, доступно {balance.available_eur:.2f}"
+        )
+        return await message.answer(text, reply_markup=funpay_settings_kb())
+
+    if txt.startswith("автоподъём") or txt.startswith("автоподъем"):
+        new_value = await funpay_toggle_auto_raise()
+        status = "включён" if new_value else "выключен"
+        return await message.answer(
+            f"Автоподъём лотов {status}.",
+            reply_markup=funpay_settings_kb()
+        )
+
+    if txt in {"изменить golden key", "ввести golden key"}:
+        await state.update_data(funpay_return_state="funpay")
+        await state.set_state(DataBackup.funpay_wait_key)
+        return await message.answer(
+            "Отправьте FunPay Golden Key одним сообщением.",
+            reply_markup=cancel_kb
+        )
+
+    if txt in {"изменить user-agent", "ввести user-agent"}:
+        await state.update_data(funpay_return_state="funpay")
+        await state.set_state(DataBackup.funpay_wait_user_agent)
+        return await message.answer(
+            "Отправьте FunPay User-Agent одним сообщением.",
+            reply_markup=cancel_kb
+        )
+
+    return await message.answer(funpay_status_text(), reply_markup=funpay_settings_kb())
 
 # ────────────────────────────────────────────────
 #  Сдача в аренду
@@ -2046,6 +2406,7 @@ async def extend_confirm(message: types.Message, state: FSMContext):
 
 async def checker_loop():
     last_faceit_scan = 0.0
+    global FUNPAY_AUTO_RAISE_LAST_RUN
     while True:
         try:
             if DB_MAINTENANCE:
@@ -2076,6 +2437,20 @@ async def checker_loop():
                     for admin_id in ADMIN_IDS:
                         await bot.send_message(admin_id, notification)
                 last_faceit_scan = now_ts
+
+            if get_funpay_auto_raise_enabled():
+                golden_key = resolve_funpay_golden_key()
+                if golden_key and now_ts - FUNPAY_AUTO_RAISE_LAST_RUN >= FUNPAY_AUTO_RAISE_INTERVAL_SECONDS:
+                    raise_result = await funpay_raise_all_lots()
+                    if raise_result.get("error"):
+                        logging.error("FunPay auto raise error: %s", raise_result["error"])
+                    else:
+                        logging.info(
+                            "FunPay auto raise completed: raised=%d errors=%d",
+                            len(raise_result.get("raised", [])),
+                            len(raise_result.get("errors", [])),
+                        )
+                    FUNPAY_AUTO_RAISE_LAST_RUN = now_ts
         except Exception as e:
             logging.error(f"checker_loop: {e}")
         await asyncio.sleep(30)
