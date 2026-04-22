@@ -965,9 +965,8 @@ async def build_account_details_text(row) -> str:
 def detail_actions_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="Редактировать"), KeyboardButton(text="Steam код")],
-            [KeyboardButton(text="2FA код")],
-            [KeyboardButton(text="Удалить")],
+            [KeyboardButton(text="Код Steam"), KeyboardButton(text="Код Faceit")],
+            [KeyboardButton(text="Редактировать"), KeyboardButton(text="Удалить")],
             [KeyboardButton(text="Назад")],
         ],
         resize_keyboard=True
@@ -1010,10 +1009,10 @@ def edit_fields_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Steam логин"), KeyboardButton(text="Steam пароль")],
+            [KeyboardButton(text="Steam shared secret")],
             [KeyboardButton(text="Email"), KeyboardButton(text="Пароль email")],
             [KeyboardButton(text="Faceit ссылка"), KeyboardButton(text="Faceit email")],
             [KeyboardButton(text="Пароль Faceit"), KeyboardButton(text="Faceit 2FA secret")],
-            [KeyboardButton(text="Steam shared secret")],
             [KeyboardButton(text="Назад")],
         ],
         resize_keyboard=True
@@ -1327,7 +1326,7 @@ async def account_detail_action(message: types.Message, state: FSMContext):
         await state.clear()
         return await render_accounts_list(message, state)
 
-    if txt == "steam код":
+    if txt in {"steam код", "код steam", "код стим"}:
         if not row:
             await state.clear()
             return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
@@ -1355,7 +1354,7 @@ async def account_detail_action(message: types.Message, state: FSMContext):
             reply_markup=detail_actions_kb()
         )
 
-    if txt == "2fa код":
+    if txt in {"2fa код", "код faceit", "код фэйсит", "код фейсит"}:
         if not row:
             await state.clear()
             return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
