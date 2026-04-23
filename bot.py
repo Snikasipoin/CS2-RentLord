@@ -417,6 +417,7 @@ class AddAccount(StatesGroup):
     confirm         = State()
 
 class RentAccount(StatesGroup):
+    mode = State()
     select_account = State()
     select_time    = State()
 
@@ -1265,6 +1266,49 @@ def build_block_menu_text(row, target: str) -> str:
     )
 
 
+def get_rentable_accounts(mode: str) -> list[tuple]:
+    if mode == "steam":
+        cursor.execute(
+            """
+            SELECT id, steam_login
+              FROM accounts
+             WHERE status='free'
+               AND COALESCE(steam_blocked, 0) = 0
+             ORDER BY steam_login
+            """
+        )
+        return cursor.fetchall()
+
+    if mode == "faceit":
+        cursor.execute(
+            """
+            SELECT id, steam_login
+              FROM accounts
+             WHERE status='free'
+               AND COALESCE(faceit_blocked, 0) = 0
+               AND (
+                    (faceit_url IS NOT NULL AND TRIM(faceit_url) != '')
+                    OR (faceit_email IS NOT NULL AND TRIM(faceit_email) != '')
+                    OR (faceit_password IS NOT NULL AND TRIM(faceit_password) != '')
+               )
+             ORDER BY steam_login
+            """
+        )
+        return cursor.fetchall()
+
+    cursor.execute(
+        """
+        SELECT id, steam_login
+          FROM accounts
+         WHERE status='free'
+           AND COALESCE(steam_blocked, 0) = 0
+           AND COALESCE(faceit_blocked, 0) = 0
+         ORDER BY steam_login
+        """
+    )
+    return cursor.fetchall()
+
+
 async def build_account_details_text(row) -> str:
     s_login, s_pw_enc, email, e_pw_enc, f_url, f_email, f_pw_enc, st, rent_end, *rest = row
     s_pw = decrypt(s_pw_enc)
@@ -1371,6 +1415,29 @@ def block_actions_kb() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="6 часов"), KeyboardButton(text="12 часов"), KeyboardButton(text="1 день")],
             [KeyboardButton(text="Снять блок")],
             [KeyboardButton(text="Назад")],
+        ],
+        resize_keyboard=True
+    )
+
+
+def rent_mode_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Steam"), KeyboardButton(text="Faceit")],
+            [KeyboardButton(text="Steam + Faceit")],
+            [KeyboardButton(text="Назад")],
+        ],
+        resize_keyboard=True
+    )
+
+
+def rent_time_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="30 минут"), KeyboardButton(text="1 час"), KeyboardButton(text="2 часа")],
+            [KeyboardButton(text="3 часа"), KeyboardButton(text="6 часов"), KeyboardButton(text="12 часов")],
+            [KeyboardButton(text="24 часа")],
+            [KeyboardButton(text="Отмена")]
         ],
         resize_keyboard=True
     )
@@ -2355,8 +2422,8 @@ async def show_status(message: types.Message, state: FSMContext):
     clean_expired_faceit_blocks()
     clean_expired_steam_blocks()
 
-    cursor.execute("SELECT COUNT(*) FROM accounts WHERE status='free' AND COALESCE(faceit_blocked, 0) = 0")
-    free = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM accounts WHERE status='free' AND COALESCE(steam_blocked, 0) = 0")
+    free_steam = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM accounts WHERE status='busy'")
     busy = cursor.fetchone()[0]
     cursor.execute(
@@ -2373,6 +2440,21 @@ async def show_status(message: types.Message, state: FSMContext):
         """
     )
     free_faceit = cursor.fetchone()[0]
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+          FROM accounts
+         WHERE status='free'
+           AND COALESCE(steam_blocked, 0) = 0
+           AND COALESCE(faceit_blocked, 0) = 0
+           AND (
+                (faceit_url IS NOT NULL AND faceit_url != '')
+                OR (faceit_email IS NOT NULL AND faceit_email != '')
+                OR (faceit_password IS NOT NULL AND faceit_password != '')
+           )
+        """
+    )
+    free_both = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM accounts WHERE COALESCE(faceit_blocked, 0) = 1")
     blocked_faceit = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM accounts WHERE COALESCE(steam_blocked, 0) = 1")
@@ -2380,9 +2462,10 @@ async def show_status(message: types.Message, state: FSMContext):
 
     await state.set_state(StatusMenu.menu)
     await message.answer(
-        f"Свободных: {free}\n"
+        f"Свободных Steam: {free_steam}\n"
         f"Занятых: {busy}\n"
-        f"Свободных с Faceit: {free_faceit}\n"
+        f"Свободных Faceit: {free_faceit}\n"
+        f"Свободных Steam + Faceit: {free_both}\n"
         f"Блокировок Faceit: {blocked_faceit}\n"
         f"Блокировок Steam: {blocked_steam}",
         reply_markup=status_menu_kb()
@@ -2534,60 +2617,66 @@ async def rent_start(message: types.Message, state: FSMContext):
     clean_expired_faceit_blocks()
     clean_expired_steam_blocks()
 
-    cursor.execute(
-        """
-        SELECT id, steam_login
-          FROM accounts
-         WHERE status='free'
-           AND COALESCE(faceit_blocked, 0) = 0
-         ORDER BY steam_login
-        """
-    )
-    rows = cursor.fetchall()
-    if not rows:
-        return await message.answer("Нет свободных аккаунтов", reply_markup=main_menu)
+    await state.set_state(RentAccount.mode)
+    await state.update_data(rent_mode=None)
+    await message.answer("Выберите режим аренды:", reply_markup=rent_mode_kb())
 
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=login)] for _, login in rows] + [[KeyboardButton(text="Отмена")]],
-        resize_keyboard=True
-    )
-    await state.set_state(RentAccount.select_account)
-    await state.update_data(accounts=rows)
-    await message.answer("Выберите аккаунт:", reply_markup=kb)
+
+@dp.message(StateFilter(RentAccount.mode))
+async def rent_select_mode(message: types.Message, state: FSMContext):
+    txt = (message.text or "").strip().lower()
+
+    if txt == "назад" or txt == "отмена":
+        await state.clear()
+        return await message.answer("Сдача отменена.", reply_markup=main_menu)
+
+    if txt in {"steam", "faceit", "steam + faceit"}:
+        mode = "steam" if txt == "steam" else "faceit" if txt == "faceit" else "both"
+        rows = get_rentable_accounts(mode)
+        if not rows:
+            return await message.answer(
+                "Под этот режим сейчас нет свободных аккаунтов.",
+                reply_markup=rent_mode_kb()
+            )
+
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text=login)] for _, login in rows] + [[KeyboardButton(text="Отмена")]],
+            resize_keyboard=True
+        )
+        await state.set_state(RentAccount.select_account)
+        await state.update_data(accounts=rows, rent_mode=mode)
+        return await message.answer("Выберите аккаунт:", reply_markup=kb)
+
+    return await message.answer("Выберите режим аренды кнопкой.", reply_markup=rent_mode_kb())
 
 @dp.message(StateFilter(RentAccount.select_account))
 async def rent_select_account(message: types.Message, state: FSMContext):
-    login = message.text.strip()
+    login = (message.text or "").strip()
+    if login.lower() in {"отмена", "назад"}:
+        await state.set_state(RentAccount.mode)
+        return await message.answer("Выберите режим аренды:", reply_markup=rent_mode_kb())
+
     data = await state.get_data()
     acc = next((aid for aid, l in data.get("accounts", []) if l == login), None)
 
     if acc is None:
-        return await message.answer("Аккаунт не найден в списке свободных", reply_markup=main_menu)
+        return await message.answer("Аккаунт не найден в списке свободных", reply_markup=rent_mode_kb())
 
     await state.update_data(selected_id=acc, selected_login=login)
 
-    times_kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="30 минут"), KeyboardButton(text="1 час"), KeyboardButton(text="2 часа")],
-            [KeyboardButton(text="3 часа"), KeyboardButton(text="6 часов"), KeyboardButton(text="12 часов")],
-            [KeyboardButton(text="24 часа")],
-            [KeyboardButton(text="Отмена")]
-        ],
-        resize_keyboard=True
-    )
     await state.set_state(RentAccount.select_time)
-    await message.answer("На сколько времени?", reply_markup=times_kb)
+    await message.answer("На сколько времени?", reply_markup=rent_time_kb())
 
 @dp.message(StateFilter(RentAccount.select_time))
 async def rent_confirm_time(message: types.Message, state: FSMContext):
     txt = (message.text or "").strip().lower()
     if txt == "отмена":
-        await state.clear()
-        return await message.answer("Сдача отменена", reply_markup=main_menu)
+        await state.set_state(RentAccount.mode)
+        return await message.answer("Выберите режим аренды:", reply_markup=rent_mode_kb())
 
     delta = parse_extend_delta(txt)
     if delta is None:
-        return await message.answer("Выберите время из списка", reply_markup=main_menu)
+        return await message.answer("Выберите время из списка", reply_markup=rent_time_kb())
 
     data = await state.get_data()
     aid = data["selected_id"]
