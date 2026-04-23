@@ -2680,10 +2680,9 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
                 should_send_faceit = rent_package == "steam_faceit" and not bool(faceit_blocked)
                 if should_send_faceit and (f_url or f_email or f_pw_enc):
                     faceit_text = (
-                        "\nFaceit:"
-                        f"\n  Ссылка: {f_url or '-'}"
-                        f"\nFaceit email: {f_email or '-'}"
-                        f"\nFaceit пароль: {decrypt(f_pw_enc) if f_pw_enc else '-'}"
+                        "\nFaceit email: "
+                        f"{f_email or '-'}\n"
+                        f"Faceit пароль: {decrypt(f_pw_enc) if f_pw_enc else '-'}"
                     )
 
                 await message.answer(
