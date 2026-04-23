@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import tempfile
+import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, unquote, parse_qs
 import base64
@@ -318,6 +319,29 @@ def ensure_faceit_block_columns():
         ("faceit_block_game", "TEXT"),
         ("faceit_ban_signature", "TEXT"),
         ("faceit_block_last_checked_at", "TEXT"),
+        ("faceit_block_source", "TEXT DEFAULT 'api'"),
+    ]
+
+    changed = False
+    for column_name, column_def in additions:
+        if column_name not in columns:
+            cursor.execute(f"ALTER TABLE accounts ADD COLUMN {column_name} {column_def}")
+            changed = True
+
+    if changed:
+        conn.commit()
+
+
+def ensure_steam_block_columns():
+    cursor.execute("PRAGMA table_info(accounts)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    additions = [
+        ("steam_blocked", "INTEGER DEFAULT 0"),
+        ("steam_block_ends_at", "TEXT"),
+        ("steam_block_reason", "TEXT"),
+        ("steam_block_type", "TEXT"),
+        ("steam_block_source", "TEXT DEFAULT 'manual'"),
     ]
 
     changed = False
@@ -344,6 +368,7 @@ def ensure_steam_shared_secret_column():
     if "steam_shared_secret" not in columns:
         cursor.execute("ALTER TABLE accounts ADD COLUMN steam_shared_secret TEXT")
         conn.commit()
+
 
 def ensure_faceit_url_column():
     cursor.execute("PRAGMA table_info(accounts)")
@@ -412,6 +437,9 @@ class EditAccount(StatesGroup):
 
 class DeleteAccount(StatesGroup):
     confirm = State()
+
+class BlockAccount(StatesGroup):
+    menu = State()
 
 class DataBackup(StatesGroup):
     choose_action = State()
@@ -510,6 +538,7 @@ def clean_expired_faceit_blocks():
                        faceit_block_type = NULL,
                        faceit_block_game = NULL,
                        faceit_ban_signature = NULL,
+                       faceit_block_source = NULL,
                        faceit_block_last_checked_at = NULL
                  WHERE id = ?
                 """,
@@ -519,6 +548,44 @@ def clean_expired_faceit_blocks():
             conn.commit()
     except Exception as e:
         logging.error(f"clean_expired_faceit_blocks error: {e}")
+
+
+def clean_expired_steam_blocks():
+    try:
+        cursor.execute(
+            """
+            SELECT id, steam_block_ends_at
+              FROM accounts
+             WHERE steam_blocked = 1
+               AND steam_block_ends_at IS NOT NULL
+            """
+        )
+        expired_ids = []
+        for aid, ends_at_raw in cursor.fetchall():
+            ends_at = parse_iso_datetime(ends_at_raw)
+            if ends_at is None:
+                continue
+            local_now = datetime.now(ends_at.tzinfo) if ends_at.tzinfo else datetime.now()
+            if ends_at <= local_now:
+                expired_ids.append(aid)
+
+        for aid in expired_ids:
+            cursor.execute(
+                """
+                UPDATE accounts
+                   SET steam_blocked = 0,
+                       steam_block_ends_at = NULL,
+                       steam_block_reason = NULL,
+                       steam_block_type = NULL,
+                       steam_block_source = NULL
+                 WHERE id = ?
+                """,
+                (aid,),
+            )
+        if expired_ids:
+            conn.commit()
+    except Exception as e:
+        logging.error(f"clean_expired_steam_blocks error: {e}")
 
 
 def get_account_by_id(aid: int):
@@ -532,6 +599,12 @@ def get_account_by_id(aid: int):
                faceit_block_game,
                faceit_ban_signature,
                faceit_block_last_checked_at,
+               faceit_block_source,
+               COALESCE(steam_blocked, 0),
+               steam_block_ends_at,
+               steam_block_reason,
+               steam_block_type,
+               steam_block_source,
                faceit_2fa_secret,
                steam_shared_secret
           FROM accounts
@@ -540,6 +613,93 @@ def get_account_by_id(aid: int):
         (aid,),
     )
     return cursor.fetchone()
+
+
+def set_account_block(aid: int, target: str, ends_at: datetime | None, reason: str | None = None, block_type: str | None = None, source: str | None = None) -> None:
+    if target == "faceit":
+        cursor.execute(
+            """
+            UPDATE accounts
+               SET faceit_blocked = ?,
+                   faceit_block_ends_at = ?,
+                   faceit_block_reason = ?,
+                   faceit_block_type = ?,
+                   faceit_block_source = ?,
+                   faceit_block_last_checked_at = ?
+             WHERE id = ?
+            """,
+            (
+                1 if ends_at else 0,
+                ends_at.isoformat() if ends_at else None,
+                reason,
+                block_type,
+                source or "manual",
+                datetime.now(timezone.utc).isoformat(),
+                aid,
+            ),
+        )
+        return
+
+    if target == "steam":
+        cursor.execute(
+            """
+            UPDATE accounts
+               SET steam_blocked = ?,
+                   steam_block_ends_at = ?,
+                   steam_block_reason = ?,
+                   steam_block_type = ?,
+                   steam_block_source = ?
+             WHERE id = ?
+            """,
+            (
+                1 if ends_at else 0,
+                ends_at.isoformat() if ends_at else None,
+                reason,
+                block_type,
+                source or "manual",
+                aid,
+            ),
+        )
+        return
+
+    raise ValueError(f"Unknown block target: {target}")
+
+
+def clear_account_block(aid: int, target: str) -> None:
+    if target == "faceit":
+        cursor.execute(
+            """
+            UPDATE accounts
+               SET faceit_blocked = 0,
+                   faceit_block_ends_at = NULL,
+                   faceit_block_reason = NULL,
+                   faceit_block_type = NULL,
+                   faceit_block_game = NULL,
+                   faceit_ban_signature = NULL,
+                   faceit_block_source = NULL,
+                   faceit_block_last_checked_at = NULL
+             WHERE id = ?
+            """,
+            (aid,),
+        )
+        return
+
+    if target == "steam":
+        cursor.execute(
+            """
+            UPDATE accounts
+               SET steam_blocked = 0,
+                   steam_block_ends_at = NULL,
+                   steam_block_reason = NULL,
+                   steam_block_type = NULL,
+                   steam_block_source = NULL
+             WHERE id = ?
+            """,
+            (aid,),
+        )
+        return
+
+    raise ValueError(f"Unknown block target: {target}")
 
 
 def extract_faceit_nickname(faceit_url: str | None) -> str | None:
@@ -934,9 +1094,10 @@ async def sync_faceit_bans(send_notifications: bool = False) -> dict:
         }
 
     clean_expired_faceit_blocks()
+    clean_expired_steam_blocks()
     cursor.execute(
         """
-        SELECT id, steam_login, faceit_url, faceit_blocked, faceit_block_ends_at, faceit_ban_signature
+        SELECT id, steam_login, faceit_url, faceit_blocked, faceit_block_ends_at, faceit_ban_signature, faceit_block_source
           FROM accounts
          WHERE faceit_url IS NOT NULL
            AND TRIM(faceit_url) != ''
@@ -950,7 +1111,7 @@ async def sync_faceit_bans(send_notifications: bool = False) -> dict:
     errors = []
     updated_count = 0
 
-    for aid, steam_login, faceit_url, faceit_blocked, faceit_block_ends_at, faceit_ban_signature in rows:
+    for aid, steam_login, faceit_url, faceit_blocked, faceit_block_ends_at, faceit_ban_signature, faceit_block_source in rows:
         result = await fetch_faceit_active_ban(faceit_url, api_key)
         error = result.get("error")
         ban = result.get("ban")
@@ -961,7 +1122,7 @@ async def sync_faceit_bans(send_notifications: bool = False) -> dict:
             continue
 
         if ban is None:
-            if faceit_blocked:
+            if faceit_blocked and (faceit_block_source or "api") != "manual":
                 cursor.execute(
                     """
                     UPDATE accounts
@@ -971,6 +1132,7 @@ async def sync_faceit_bans(send_notifications: bool = False) -> dict:
                            faceit_block_type = NULL,
                            faceit_block_game = NULL,
                            faceit_ban_signature = NULL,
+                           faceit_block_source = NULL,
                            faceit_block_last_checked_at = ?
                      WHERE id = ?
                     """,
@@ -1005,6 +1167,7 @@ async def sync_faceit_bans(send_notifications: bool = False) -> dict:
                    faceit_block_type = ?,
                    faceit_block_game = ?,
                    faceit_ban_signature = ?,
+                   faceit_block_source = 'api',
                    faceit_block_last_checked_at = ?
              WHERE id = ?
             """,
@@ -1040,6 +1203,68 @@ async def sync_faceit_bans(send_notifications: bool = False) -> dict:
     }
 
 
+def append_block_section(
+    details_lines: list[str],
+    title: str,
+    blocked: bool,
+    ends_at_raw,
+    reason: str | None,
+    block_type: str | None,
+    source: str | None,
+) -> None:
+    if not blocked:
+        return
+
+    source_text = source or "-"
+    block_type_text = block_type or "-"
+    reason_text = reason or "-"
+    ends_at = parse_iso_datetime(ends_at_raw)
+
+    details_lines.extend([
+        "",
+        f"{title} блокировка:",
+        "  Статус: активна",
+        f"  Источник: {source_text}",
+        f"  Тип: {block_type_text}",
+        f"  Причина: {reason_text}",
+        f"  До конца блокировки: {format_remaining_time(ends_at) if ends_at else 'неизвестно'}",
+    ])
+
+
+def build_block_menu_text(row, target: str) -> str:
+    login = row[0]
+
+    if target == "faceit":
+        blocked = bool(row[9])
+        ends_at_raw = row[10]
+        reason = row[11]
+        block_type = row[12]
+        source = row[16] if len(row) > 16 else None
+        title = "Faceit"
+    else:
+        blocked = bool(row[17])
+        ends_at_raw = row[18]
+        reason = row[19]
+        block_type = row[20]
+        source = row[21] if len(row) > 21 else None
+        title = "Steam"
+
+    ends_text = "не установлена"
+    ends_dt = parse_iso_datetime(ends_at_raw)
+    if blocked and ends_dt:
+        ends_text = f"{ends_dt.astimezone().strftime('%d.%m.%Y %H:%M')} ({format_remaining_time(ends_dt)})"
+
+    return (
+        f"{title} блокировка для аккаунта {login}\n"
+        f"Статус: {'активна' if blocked else 'не установлена'}\n"
+        f"Источник: {source or '-'}\n"
+        f"Тип: {block_type or '-'}\n"
+        f"Причина: {reason or '-'}\n"
+        f"До конца блокировки: {ends_text}\n\n"
+        "Выберите срок кнопкой или отправьте текстом, например: 2 дня, 5 часов, 30 минут."
+    )
+
+
 async def build_account_details_text(row) -> str:
     s_login, s_pw_enc, email, e_pw_enc, f_url, f_email, f_pw_enc, st, rent_end, *rest = row
     s_pw = decrypt(s_pw_enc)
@@ -1049,8 +1274,14 @@ async def build_account_details_text(row) -> str:
     faceit_block_ends_at = rest[1] if len(rest) > 1 else None
     faceit_block_reason = rest[2] if len(rest) > 2 else None
     faceit_block_type = rest[3] if len(rest) > 3 else None
-    faceit_2fa_secret = rest[7] if len(rest) > 7 else None
-    steam_shared_secret = rest[8] if len(rest) > 8 else None
+    faceit_block_source = rest[7] if len(rest) > 7 else None
+    steam_blocked = bool(rest[8]) if len(rest) > 8 and rest[8] is not None else False
+    steam_block_ends_at = rest[9] if len(rest) > 9 else None
+    steam_block_reason = rest[10] if len(rest) > 10 else None
+    steam_block_type = rest[11] if len(rest) > 11 else None
+    steam_block_source = rest[12] if len(rest) > 12 else None
+    faceit_2fa_secret = rest[13] if len(rest) > 13 else None
+    steam_shared_secret = rest[14] if len(rest) > 14 else None
 
     details_lines = [
         f"Данные аккаунта: {s_login}",
@@ -1091,27 +1322,26 @@ async def build_account_details_text(row) -> str:
         f"  Статус: {'подключён' if steam_shared_secret else 'не настроен'}",
     ])
 
-    block_dt = parse_iso_datetime(faceit_block_ends_at)
-    if faceit_blocked and block_dt:
-        details_lines.extend([
-            "",
-            "Faceit блокировка:",
-            "  Статус: активна",
-            f"  Тип: {faceit_block_type or '-'}",
-            f"  Причина: {faceit_block_reason or '-'}",
-            f"  До конца блокировки: {format_remaining_time(block_dt)}",
-        ])
-    elif faceit_blocked:
-        details_lines.extend([
-            "",
-            "Faceit блокировка:",
-            "  Статус: активна",
-            f"  Тип: {faceit_block_type or '-'}",
-            f"  Причина: {faceit_block_reason or '-'}",
-            "  До конца блокировки: неизвестно",
-        ])
+    append_block_section(
+        details_lines,
+        "Faceit",
+        faceit_blocked,
+        faceit_block_ends_at,
+        faceit_block_reason,
+        faceit_block_type,
+        faceit_block_source,
+    )
+    append_block_section(
+        details_lines,
+        "Steam",
+        steam_blocked,
+        steam_block_ends_at,
+        steam_block_reason,
+        steam_block_type,
+        steam_block_source or "manual",
+    )
 
-    if st == "busy" and rent_end and not faceit_blocked:
+    if st == "busy" and rent_end:
         try:
             dt = datetime.fromisoformat(rent_end)
             mins = max(0, int((dt - datetime.now()).total_seconds() / 60))
@@ -1126,7 +1356,20 @@ def detail_actions_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Код Steam"), KeyboardButton(text="Код Faceit")],
+            [KeyboardButton(text="Блокировка Faceit"), KeyboardButton(text="Блокировка Steam")],
             [KeyboardButton(text="Редактировать"), KeyboardButton(text="Удалить")],
+            [KeyboardButton(text="Назад")],
+        ],
+        resize_keyboard=True
+    )
+
+
+def block_actions_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="30 минут"), KeyboardButton(text="1 час"), KeyboardButton(text="3 часа")],
+            [KeyboardButton(text="6 часов"), KeyboardButton(text="12 часов"), KeyboardButton(text="1 день")],
+            [KeyboardButton(text="Снять блок")],
             [KeyboardButton(text="Назад")],
         ],
         resize_keyboard=True
@@ -1237,6 +1480,38 @@ def parse_extend_delta(text: str) -> timedelta | None:
     return None
 
 
+def parse_block_duration(text: str) -> timedelta | None:
+    raw = (text or "").strip().lower()
+    if not raw:
+        return None
+
+    normalized = raw.replace(",", ".")
+    presets = {
+        "30 минут": timedelta(minutes=30),
+        "1 час": timedelta(hours=1),
+        "3 часа": timedelta(hours=3),
+        "6 часов": timedelta(hours=6),
+        "12 часов": timedelta(hours=12),
+        "1 день": timedelta(days=1),
+    }
+    if normalized in presets:
+        return presets[normalized]
+
+    match = re.fullmatch(r"(\d+)\s*(минут(?:а|ы)?|мин|час(?:а|ов)?|day|days|дн(?:я|ей)?|день)", normalized)
+    if not match:
+        return None
+
+    amount = int(match.group(1))
+    unit = match.group(2)
+    if unit in {"минут", "минута", "минуты", "мин"}:
+        return timedelta(minutes=amount)
+    if unit in {"час", "часа", "часов"}:
+        return timedelta(hours=amount)
+    if unit in {"day", "days", "день", "дня", "дней"}:
+        return timedelta(days=amount)
+    return None
+
+
 def write_database_backup(backup_path: str) -> None:
     conn.commit()
     dest = sqlite3.connect(backup_path)
@@ -1268,6 +1543,8 @@ def restore_database_from_file(backup_path: str) -> None:
         src.close()
 
     ensure_faceit_url_column()
+    ensure_faceit_block_columns()
+    ensure_steam_block_columns()
     migrate_encryption()
 
 # ────────────────────────────────────────────────
@@ -1434,6 +1711,7 @@ async def show_accounts(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
     clean_invalid_dates()
     clean_expired_faceit_blocks()
+    clean_expired_steam_blocks()
 
     await render_accounts_list(message, state)
 
@@ -1442,7 +1720,7 @@ async def render_accounts_list(message: types.Message, state: FSMContext):
     await state.clear()
     cursor.execute(
         """
-        SELECT id, steam_login, status, rent_end, faceit_blocked, faceit_block_ends_at
+        SELECT id, steam_login, status, rent_end, faceit_blocked, faceit_block_ends_at, steam_blocked, steam_block_ends_at
           FROM accounts
          ORDER BY steam_login
         """
@@ -1454,23 +1732,39 @@ async def render_accounts_list(message: types.Message, state: FSMContext):
 
     lines = []
     rows_data = []
-    for aid, login, st, end, blocked, block_end in rows:
-        rows_data.append({"id": aid, "login": login, "status": st, "end": end, "blocked": blocked, "block_end": block_end})
-        if blocked:
-            block_dt = parse_iso_datetime(block_end)
-            if block_dt:
-                lines.append(f"🔒 {login} — {format_remaining_time(block_dt)} до конца блокировки")
-            else:
-                lines.append(f"🔒 {login} — блокировка Faceit")
-        elif st == "free":
-            lines.append(f"🟢 {login}")
-        else:
+    for aid, login, st, end, faceit_blocked, faceit_block_end, steam_blocked, steam_block_end in rows:
+        rows_data.append({
+            "id": aid,
+            "login": login,
+            "status": st,
+            "end": end,
+            "faceit_blocked": faceit_blocked,
+            "faceit_block_end": faceit_block_end,
+            "steam_blocked": steam_blocked,
+            "steam_block_end": steam_block_end,
+        })
+
+        has_blocks = bool(faceit_blocked) or bool(steam_blocked)
+        prefix = "🔴" if st == "busy" else ("🔒" if has_blocks else "🟢")
+        parts = [f"{prefix} {login}"]
+
+        if st == "busy" and end:
             try:
                 dt = datetime.fromisoformat(end)
                 mins = max(0, int((dt - datetime.now()).total_seconds() / 60))
-                lines.append(f"🔴 {login} — {mins} мин")
-            except:
-                lines.append(f"🟢 {login} (ошибка даты)")
+                parts.append(f"аренда {mins} мин")
+            except Exception:
+                parts.append("аренда: ошибка даты")
+
+        if faceit_blocked:
+            block_dt = parse_iso_datetime(faceit_block_end)
+            parts.append("Faceit " + (format_remaining_time(block_dt) if block_dt else "блокировка"))
+
+        if steam_blocked:
+            block_dt = parse_iso_datetime(steam_block_end)
+            parts.append("Steam " + (format_remaining_time(block_dt) if block_dt else "блокировка"))
+
+        lines.append(" | ".join(parts))
 
     kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=acc["login"])] for acc in rows_data] + [[KeyboardButton(text="Отмена")]],
@@ -1575,6 +1869,19 @@ async def account_detail_action(message: types.Message, state: FSMContext):
             reply_markup=detail_actions_kb()
         )
 
+    if txt in {"блокировка faceit", "блокировка steam"}:
+        if not row:
+            await state.clear()
+            return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+        block_target = "faceit" if "faceit" in txt else "steam"
+        await state.update_data(block_target=block_target)
+        await state.set_state(BlockAccount.menu)
+        return await message.answer(
+            build_block_menu_text(row, block_target),
+            reply_markup=block_actions_kb()
+        )
+
     if txt != "редактировать":
         if txt == "удалить":
             if not row:
@@ -1602,6 +1909,67 @@ async def account_detail_action(message: types.Message, state: FSMContext):
 
     await state.set_state(EditAccount.choose_field)
     await message.answer("Что изменить?", reply_markup=edit_fields_kb())
+
+
+@dp.message(StateFilter(BlockAccount.menu))
+async def block_account_action(message: types.Message, state: FSMContext):
+    txt = (message.text or "").strip().lower()
+    data = await state.get_data()
+    aid = data.get("selected_id")
+    block_target = data.get("block_target")
+
+    if not aid or block_target not in {"faceit", "steam"}:
+        await state.clear()
+        return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+    row = get_account_by_id(aid)
+    if not row:
+        await state.clear()
+        return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+    if txt == "назад":
+        await state.set_state(AccountDetails.view_action)
+        return await message.answer(await build_account_details_text(row), reply_markup=detail_actions_kb())
+
+    if txt in {"снять блок", "снять"}:
+        try:
+            clear_account_block(aid, block_target)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"clear block error: {e}")
+            return await message.answer("Не удалось снять блокировку.", reply_markup=block_actions_kb())
+
+        await state.set_state(AccountDetails.view_action)
+        updated = get_account_by_id(aid)
+        return await message.answer(await build_account_details_text(updated or row), reply_markup=detail_actions_kb())
+
+    duration = parse_block_duration(txt)
+    if duration is None:
+        return await message.answer(
+            "Выберите срок кнопкой или отправьте его текстом, например: 2 дня, 5 часов, 30 минут.",
+            reply_markup=block_actions_kb()
+        )
+
+    ends_at = datetime.now(timezone.utc) + duration
+    try:
+        set_account_block(
+            aid,
+            block_target,
+            ends_at,
+            reason="ручная блокировка",
+            block_type="manual",
+            source="manual",
+        )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"set block error: {e}")
+        return await message.answer("Не удалось сохранить блокировку.", reply_markup=block_actions_kb())
+
+    await state.set_state(AccountDetails.view_action)
+    updated = get_account_by_id(aid)
+    return await message.answer(await build_account_details_text(updated or row), reply_markup=detail_actions_kb())
 
 
 @dp.message(StateFilter(DeleteAccount.confirm))
@@ -1985,6 +2353,7 @@ async def show_status(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
     clean_invalid_dates()
     clean_expired_faceit_blocks()
+    clean_expired_steam_blocks()
 
     cursor.execute("SELECT COUNT(*) FROM accounts WHERE status='free' AND COALESCE(faceit_blocked, 0) = 0")
     free = cursor.fetchone()[0]
@@ -2006,13 +2375,16 @@ async def show_status(message: types.Message, state: FSMContext):
     free_faceit = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM accounts WHERE COALESCE(faceit_blocked, 0) = 1")
     blocked_faceit = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM accounts WHERE COALESCE(steam_blocked, 0) = 1")
+    blocked_steam = cursor.fetchone()[0]
 
     await state.set_state(StatusMenu.menu)
     await message.answer(
         f"Свободных: {free}\n"
         f"Занятых: {busy}\n"
         f"Свободных с Faceit: {free_faceit}\n"
-        f"Блокировок Faceit: {blocked_faceit}",
+        f"Блокировок Faceit: {blocked_faceit}\n"
+        f"Блокировок Steam: {blocked_steam}",
         reply_markup=status_menu_kb()
     )
 
@@ -2027,6 +2399,7 @@ async def status_menu_actions(message: types.Message, state: FSMContext):
 
     if txt == "проверка блокировок faceit":
         clean_expired_faceit_blocks()
+        clean_expired_steam_blocks()
         result = await sync_faceit_bans(send_notifications=True)
 
         blocked_accounts = result.get("active_blocks", [])
@@ -2159,6 +2532,7 @@ async def rent_start(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
     clean_invalid_dates()
     clean_expired_faceit_blocks()
+    clean_expired_steam_blocks()
 
     cursor.execute(
         """
@@ -2414,6 +2788,7 @@ async def checker_loop():
                 continue
             clean_invalid_dates()
             clean_expired_faceit_blocks()
+            clean_expired_steam_blocks()
             cursor.execute("SELECT id, steam_login, rent_end FROM accounts WHERE status='busy'")
             for row in cursor.fetchall():
                 try:
@@ -2463,6 +2838,7 @@ async def main():
     global FACEIT_API_KEY
     ensure_faceit_url_column()
     ensure_faceit_block_columns()
+    ensure_steam_block_columns()
     ensure_faceit_2fa_column()
     ensure_steam_shared_secret_column()
     migrate_encryption()
