@@ -1266,47 +1266,33 @@ def build_block_menu_text(row, target: str) -> str:
     )
 
 
-def get_rentable_accounts(mode: str) -> list[tuple]:
-    if mode == "steam":
-        cursor.execute(
-            """
-            SELECT id, steam_login
-              FROM accounts
-             WHERE status='free'
-               AND COALESCE(steam_blocked, 0) = 0
-             ORDER BY steam_login
-            """
-        )
-        return cursor.fetchall()
-
-    if mode == "faceit":
-        cursor.execute(
-            """
-            SELECT id, steam_login
-              FROM accounts
-             WHERE status='free'
-               AND COALESCE(faceit_blocked, 0) = 0
-               AND (
-                    (faceit_url IS NOT NULL AND TRIM(faceit_url) != '')
-                    OR (faceit_email IS NOT NULL AND TRIM(faceit_email) != '')
-                    OR (faceit_password IS NOT NULL AND TRIM(faceit_password) != '')
-               )
-             ORDER BY steam_login
-            """
-        )
-        return cursor.fetchall()
-
+def get_rentable_accounts() -> list[tuple]:
     cursor.execute(
         """
-        SELECT id, steam_login
+        SELECT id, steam_login, faceit_url, faceit_email, faceit_password, COALESCE(faceit_blocked, 0), COALESCE(steam_blocked, 0)
           FROM accounts
          WHERE status='free'
-           AND COALESCE(steam_blocked, 0) = 0
-           AND COALESCE(faceit_blocked, 0) = 0
+           AND NOT (COALESCE(steam_blocked, 0) = 1 AND COALESCE(faceit_blocked, 0) = 1)
          ORDER BY steam_login
         """
     )
     return cursor.fetchall()
+
+
+def determine_rent_package(faceit_url: str | None, faceit_email: str | None, faceit_password: str | None, faceit_blocked: bool) -> str:
+    has_faceit = any(
+        value and str(value).strip()
+        for value in (faceit_url, faceit_email, faceit_password)
+    )
+
+    if faceit_blocked or not has_faceit:
+        return "steam"
+
+    return "steam_faceit"
+
+
+def rent_package_label(package: str) -> str:
+    return "Steam + Faceit" if package == "steam_faceit" else "Steam only"
 
 
 async def build_account_details_text(row) -> str:
@@ -2422,39 +2408,17 @@ async def show_status(message: types.Message, state: FSMContext):
     clean_expired_faceit_blocks()
     clean_expired_steam_blocks()
 
-    cursor.execute("SELECT COUNT(*) FROM accounts WHERE status='free' AND COALESCE(steam_blocked, 0) = 0")
-    free_steam = cursor.fetchone()[0]
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+          FROM accounts
+         WHERE status='free'
+           AND NOT (COALESCE(steam_blocked, 0) = 1 AND COALESCE(faceit_blocked, 0) = 1)
+        """
+    )
+    rentable_accounts = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM accounts WHERE status='busy'")
     busy = cursor.fetchone()[0]
-    cursor.execute(
-        """
-        SELECT COUNT(*)
-          FROM accounts
-         WHERE status='free'
-           AND COALESCE(faceit_blocked, 0) = 0
-           AND (
-                (faceit_url IS NOT NULL AND faceit_url != '')
-                OR (faceit_email IS NOT NULL AND faceit_email != '')
-                OR (faceit_password IS NOT NULL AND faceit_password != '')
-           )
-        """
-    )
-    free_faceit = cursor.fetchone()[0]
-    cursor.execute(
-        """
-        SELECT COUNT(*)
-          FROM accounts
-         WHERE status='free'
-           AND COALESCE(steam_blocked, 0) = 0
-           AND COALESCE(faceit_blocked, 0) = 0
-           AND (
-                (faceit_url IS NOT NULL AND faceit_url != '')
-                OR (faceit_email IS NOT NULL AND faceit_email != '')
-                OR (faceit_password IS NOT NULL AND faceit_password != '')
-           )
-        """
-    )
-    free_both = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM accounts WHERE COALESCE(faceit_blocked, 0) = 1")
     blocked_faceit = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM accounts WHERE COALESCE(steam_blocked, 0) = 1")
@@ -2462,10 +2426,8 @@ async def show_status(message: types.Message, state: FSMContext):
 
     await state.set_state(StatusMenu.menu)
     await message.answer(
-        f"Свободных Steam: {free_steam}\n"
+        f"Свободных к сдаче: {rentable_accounts}\n"
         f"Занятых: {busy}\n"
-        f"Свободных Faceit: {free_faceit}\n"
-        f"Свободных Steam + Faceit: {free_both}\n"
         f"Блокировок Faceit: {blocked_faceit}\n"
         f"Блокировок Steam: {blocked_steam}",
         reply_markup=status_menu_kb()
@@ -2617,52 +2579,54 @@ async def rent_start(message: types.Message, state: FSMContext):
     clean_expired_faceit_blocks()
     clean_expired_steam_blocks()
 
-    await state.set_state(RentAccount.mode)
-    await state.update_data(rent_mode=None)
-    await message.answer("Выберите режим аренды:", reply_markup=rent_mode_kb())
+    rows = get_rentable_accounts()
+    if not rows:
+        return await message.answer("Нет доступных аккаунтов для сдачи.", reply_markup=main_menu)
 
+    rows_data = []
+    lines = []
+    keyboard_rows = []
 
-@dp.message(StateFilter(RentAccount.mode))
-async def rent_select_mode(message: types.Message, state: FSMContext):
-    txt = (message.text or "").strip().lower()
+    for aid, login, faceit_url, faceit_email, faceit_password, faceit_blocked, steam_blocked in rows:
+        package = determine_rent_package(faceit_url, faceit_email, faceit_password, bool(faceit_blocked))
+        rows_data.append({
+            "id": aid,
+            "login": login,
+            "faceit_url": faceit_url,
+            "faceit_email": faceit_email,
+            "faceit_password": faceit_password,
+            "faceit_blocked": faceit_blocked,
+            "steam_blocked": steam_blocked,
+            "rent_package": package,
+        })
+        lines.append(f"• {login} — {rent_package_label(package)}")
+        keyboard_rows.append([KeyboardButton(text=login)])
 
-    if txt == "назад" or txt == "отмена":
-        await state.clear()
-        return await message.answer("Сдача отменена.", reply_markup=main_menu)
-
-    if txt in {"steam", "faceit", "steam + faceit"}:
-        mode = "steam" if txt == "steam" else "faceit" if txt == "faceit" else "both"
-        rows = get_rentable_accounts(mode)
-        if not rows:
-            return await message.answer(
-                "Под этот режим сейчас нет свободных аккаунтов.",
-                reply_markup=rent_mode_kb()
-            )
-
-        kb = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text=login)] for _, login in rows] + [[KeyboardButton(text="Отмена")]],
-            resize_keyboard=True
-        )
-        await state.set_state(RentAccount.select_account)
-        await state.update_data(accounts=rows, rent_mode=mode)
-        return await message.answer("Выберите аккаунт:", reply_markup=kb)
-
-    return await message.answer("Выберите режим аренды кнопкой.", reply_markup=rent_mode_kb())
+    kb = ReplyKeyboardMarkup(
+        keyboard=keyboard_rows + [[KeyboardButton(text="Отмена")]],
+        resize_keyboard=True
+    )
+    await state.set_state(RentAccount.select_account)
+    await state.update_data(accounts=rows_data)
+    await message.answer(
+        "\n".join(lines) + "\n\nВыберите аккаунт:",
+        reply_markup=kb
+    )
 
 @dp.message(StateFilter(RentAccount.select_account))
 async def rent_select_account(message: types.Message, state: FSMContext):
     login = (message.text or "").strip()
     if login.lower() in {"отмена", "назад"}:
-        await state.set_state(RentAccount.mode)
-        return await message.answer("Выберите режим аренды:", reply_markup=rent_mode_kb())
+        await state.clear()
+        return await message.answer("Сдача отменена.", reply_markup=main_menu)
 
     data = await state.get_data()
-    acc = next((aid for aid, l in data.get("accounts", []) if l == login), None)
+    acc = next((r for r in data.get("accounts", []) if r.get("login") == login), None)
 
     if acc is None:
-        return await message.answer("Аккаунт не найден в списке свободных", reply_markup=rent_mode_kb())
+        return await message.answer("Аккаунт не найден в списке доступных", reply_markup=main_menu)
 
-    await state.update_data(selected_id=acc, selected_login=login)
+    await state.update_data(selected_id=acc["id"], selected_login=login, rent_package=acc.get("rent_package", "steam"))
 
     await state.set_state(RentAccount.select_time)
     await message.answer("На сколько времени?", reply_markup=rent_time_kb())
@@ -2671,8 +2635,8 @@ async def rent_select_account(message: types.Message, state: FSMContext):
 async def rent_confirm_time(message: types.Message, state: FSMContext):
     txt = (message.text or "").strip().lower()
     if txt == "отмена":
-        await state.set_state(RentAccount.mode)
-        return await message.answer("Выберите режим аренды:", reply_markup=rent_mode_kb())
+        await state.clear()
+        return await message.answer("Сдача отменена.", reply_markup=main_menu)
 
     delta = parse_extend_delta(txt)
     if delta is None:
@@ -2681,6 +2645,7 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
     data = await state.get_data()
     aid = data["selected_id"]
     login = data["selected_login"]
+    rent_package = data.get("rent_package", "steam")
 
     end = datetime.now() + delta
 
@@ -2701,7 +2666,7 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
 
             cursor.execute(
                 """
-                SELECT steam_login, steam_password, faceit_email, faceit_password
+                SELECT steam_login, steam_password, faceit_url, faceit_email, faceit_password, COALESCE(faceit_blocked, 0)
                   FROM accounts
                  WHERE id = ?
                 """,
@@ -2709,11 +2674,14 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
             )
             row = cursor.fetchone()
             if row:
-                s_login, s_pw_enc, f_email, f_pw_enc = row
+                s_login, s_pw_enc, f_url, f_email, f_pw_enc, faceit_blocked = row
                 s_pw = decrypt(s_pw_enc)
                 faceit_text = ""
-                if f_email or f_pw_enc:
+                should_send_faceit = rent_package == "steam_faceit" and not bool(faceit_blocked)
+                if should_send_faceit and (f_url or f_email or f_pw_enc):
                     faceit_text = (
+                        "\nFaceit:"
+                        f"\n  Ссылка: {f_url or '-'}"
                         f"\nFaceit email: {f_email or '-'}"
                         f"\nFaceit пароль: {decrypt(f_pw_enc) if f_pw_enc else '-'}"
                     )
