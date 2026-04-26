@@ -19,7 +19,7 @@ from cryptography.fernet import Fernet, InvalidToken
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, FSInputFile
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CopyTextButton
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
@@ -1429,6 +1429,18 @@ def rent_time_kb() -> ReplyKeyboardMarkup:
     )
 
 
+def copy_buffer_kb(copy_text: str, button_text: str = "Скопировать в буфер") -> InlineKeyboardMarkup | None:
+    value = (copy_text or "").strip()
+    if not value or len(value) > 256:
+        return None
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=button_text, copy_text=CopyTextButton(text=value))]
+        ]
+    )
+
+
 def delete_confirm_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -1891,7 +1903,7 @@ async def account_detail_action(message: types.Message, state: FSMContext):
             f"Steam Guard код для {row[0]}:\n"
             f"{code}\n"
             f"Код обновится через {seconds_left} сек.",
-            reply_markup=detail_actions_kb()
+            reply_markup=copy_buffer_kb(code, "Скопировать код")
         )
 
     if txt in {"2fa код", "код faceit", "код фэйсит", "код фейсит"}:
@@ -1919,7 +1931,7 @@ async def account_detail_action(message: types.Message, state: FSMContext):
             f"Faceit 2FA код для {row[0]}:\n"
             f"{code}\n"
             f"Код обновится через {seconds_left} сек.",
-            reply_markup=detail_actions_kb()
+            reply_markup=copy_buffer_kb(code, "Скопировать код")
         )
 
     if txt in {"блокировка faceit", "блокировка steam"}:
@@ -2676,20 +2688,32 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
             if row:
                 s_login, s_pw_enc, f_url, f_email, f_pw_enc, faceit_blocked = row
                 s_pw = decrypt(s_pw_enc)
-                faceit_text = ""
+                buyer_text_lines = [
+                    "Данные для покупателя:",
+                    f"Steam логин: {s_login}",
+                    f"Steam пароль: {s_pw}",
+                ]
+                buyer_copy_lines = [
+                    f"Steam логин: {s_login}",
+                    f"Steam пароль: {s_pw}",
+                ]
                 should_send_faceit = rent_package == "steam_faceit" and not bool(faceit_blocked)
                 if should_send_faceit and (f_url or f_email or f_pw_enc):
-                    faceit_text = (
-                        "\nFaceit email: "
-                        f"{f_email or '-'}\n"
-                        f"Faceit пароль: {decrypt(f_pw_enc) if f_pw_enc else '-'}"
-                    )
+                    faceit_email = f_email or "-"
+                    faceit_password = decrypt(f_pw_enc) if f_pw_enc else "-"
+                    buyer_text_lines.extend([
+                        "",
+                        f"Faceit email: {faceit_email}",
+                        f"Faceit пароль: {faceit_password}",
+                    ])
+                    buyer_copy_lines.extend([
+                        f"Faceit email: {faceit_email}",
+                        f"Faceit пароль: {faceit_password}",
+                    ])
 
                 await message.answer(
-                    "Данные для покупателя:\n"
-                    f"Steam логин: {s_login}\n"
-                    f"Steam пароль: {s_pw}"
-                    f"{faceit_text}"
+                    "\n".join(buyer_text_lines),
+                    reply_markup=copy_buffer_kb("\n".join(buyer_copy_lines), "Скопировать в буфер")
                 )
     except Exception as e:
         conn.rollback()
