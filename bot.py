@@ -25,8 +25,10 @@ from aiogram.fsm.context import FSMContext
 
 try:
     from FunPayAPI import Account as FunPayAccount
+    from FunPayAPI import enums as FunPayEnums
 except Exception:
     FunPayAccount = None
+    FunPayEnums = None
 
 # ────────────────────────────────────────────────
 #  Настройки и шифрование
@@ -1150,13 +1152,94 @@ def _funpay_build_account_sync(golden_key: str, user_agent: str | None = None):
     return acc
 
 
+def _funpay_collect_balance_lot_candidates(acc, limit: int = 12) -> list[int]:
+    candidates: list[int] = []
+    seen: set[int] = set()
+
+    try:
+        subcats_map = acc.get_sorted_subcategories() or {}
+    except Exception:
+        return candidates
+
+    preferred_type = None
+    if FunPayEnums is not None:
+        preferred_type = getattr(FunPayEnums.SubCategoryTypes, "COMMON", None)
+
+    ordered_types = []
+    if preferred_type in subcats_map:
+        ordered_types.append(preferred_type)
+    for subcat_type in subcats_map.keys():
+        if subcat_type != preferred_type:
+            ordered_types.append(subcat_type)
+
+    for subcat_type in ordered_types:
+        subcats = subcats_map.get(subcat_type) or {}
+        if not isinstance(subcats, dict):
+            continue
+
+        for subcat_id in subcats.keys():
+            try:
+                lots = acc.get_subcategory_public_lots(subcat_type, int(subcat_id)) or []
+            except Exception:
+                continue
+
+            for lot in lots:
+                lot_id = getattr(lot, "id", None)
+                if lot_id is None:
+                    continue
+                try:
+                    lot_id_int = int(lot_id)
+                except Exception:
+                    continue
+                if lot_id_int in seen:
+                    continue
+                seen.add(lot_id_int)
+                candidates.append(lot_id_int)
+                if len(candidates) >= limit:
+                    return candidates
+
+    return candidates
+
+
 def _funpay_fetch_balance_sync(golden_key: str, user_agent: str | None = None) -> dict:
     acc = _funpay_build_account_sync(golden_key, user_agent)
-    balance = acc.get_balance()
+    fallback_used = False
+    fallback_lot_id = None
+
+    try:
+        balance = acc.get_balance()
+    except Exception as primary_error:
+        candidates = _funpay_collect_balance_lot_candidates(acc)
+        if not candidates:
+            raise RuntimeError(
+                "Не удалось получить баланс через стандартный lot_id и не найдено "
+                "кандидатов лотов для fallback. "
+                f"Ошибка: {primary_error}"
+            ) from primary_error
+
+        last_error = primary_error
+        balance = None
+        for lot_id in candidates:
+            try:
+                balance = acc.get_balance(lot_id=lot_id)
+                fallback_used = True
+                fallback_lot_id = lot_id
+                break
+            except Exception as e:
+                last_error = e
+
+        if balance is None:
+            raise RuntimeError(
+                "Не удалось получить баланс даже после подбора lot_id. "
+                f"Последняя ошибка: {last_error}"
+            ) from last_error
+
     return {
         "username": getattr(acc, "username", None),
         "id": getattr(acc, "id", None),
         "balance": balance,
+        "fallback_used": fallback_used,
+        "fallback_lot_id": fallback_lot_id,
     }
 
 
@@ -1167,10 +1250,20 @@ def _funpay_raise_all_lots_sync(golden_key: str, user_agent: str | None = None) 
     raised = []
     errors = []
     for category_id, category in categories.items():
+        cid = None
         try:
-            result = acc.raise_lots(category_id)
+            cid = int(category_id)
+        except Exception:
+            cid = getattr(category, "id", None)
+
+        if cid is None:
+            errors.append(f"Не удалось определить category_id для {getattr(category, 'name', category_id)}")
+            continue
+
+        try:
+            result = acc.raise_lots(cid)
             raised.append({
-                "category_id": category_id,
+                "category_id": cid,
                 "category_name": getattr(category, "name", str(category_id)),
                 "result": result,
             })
@@ -2692,6 +2785,8 @@ async def funpay_menu_actions(message: types.Message, state: FSMContext):
             f"USD: всего {balance.total_usd:.2f}, доступно {balance.available_usd:.2f}\n"
             f"EUR: всего {balance.total_eur:.2f}, доступно {balance.available_eur:.2f}"
         )
+        if result.get("fallback_used"):
+            text += f"\nБаланс получен через fallback lot_id={result.get('fallback_lot_id')}"
         return await message.answer(text, reply_markup=funpay_settings_kb())
 
     if txt.startswith("автоподъём") or txt.startswith("автоподъем"):
