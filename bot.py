@@ -991,6 +991,21 @@ def format_remaining_time(end_at: datetime | None) -> str:
     return " ".join(parts) if parts else "0м"
 
 
+def format_interval_seconds(seconds: int) -> str:
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, _ = divmod(rem, 60)
+
+    parts = []
+    if hours:
+        parts.append(f"{hours}ч")
+    if minutes:
+        parts.append(f"{minutes}м")
+    if not parts:
+        parts.append("0м")
+    return " ".join(parts)
+
+
 def normalize_totp_secret(raw_value: str | None) -> str | None:
     if not raw_value:
         return None
@@ -3139,12 +3154,29 @@ async def checker_loop():
                     raise_result = await funpay_raise_all_lots()
                     if raise_result.get("error"):
                         logging.error("FunPay auto raise error: %s", raise_result["error"])
+                        for admin_id in ADMIN_IDS:
+                            await bot.send_message(
+                                admin_id,
+                                "⚠️ Автоподъем лотов FunPay завершился с ошибкой:\n"
+                                f"{raise_result['error']}"
+                            )
                     else:
+                        next_in = format_interval_seconds(FUNPAY_AUTO_RAISE_INTERVAL_SECONDS)
+                        raised_count = len(raise_result.get("raised", []))
+                        errors_count = len(raise_result.get("errors", []))
                         logging.info(
                             "FunPay auto raise completed: raised=%d errors=%d",
-                            len(raise_result.get("raised", [])),
-                            len(raise_result.get("errors", [])),
+                            raised_count,
+                            errors_count,
                         )
+                        for admin_id in ADMIN_IDS:
+                            await bot.send_message(
+                                admin_id,
+                                "✅ Произошел автоподъем лотов FunPay.\n"
+                                f"Поднято категорий: {raised_count}\n"
+                                f"Ошибок: {errors_count}\n"
+                                f"Следующий автоподъем через: {next_in}"
+                            )
                     FUNPAY_AUTO_RAISE_LAST_RUN = now_ts
         except Exception as e:
             logging.error(f"checker_loop: {e}")
