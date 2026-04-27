@@ -304,6 +304,18 @@ CREATE TABLE IF NOT EXISTS settings (
     value   TEXT NOT NULL
 )
 """)
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS rent_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id      INTEGER NOT NULL,
+    steam_login     TEXT NOT NULL,
+    rent_package    TEXT NOT NULL,
+    started_at      TEXT NOT NULL,
+    planned_end_at  TEXT NOT NULL,
+    actual_end_at   TEXT,
+    close_reason    TEXT
+)
+""")
 conn.commit()
 
 
@@ -368,6 +380,24 @@ def ensure_steam_shared_secret_column():
     if "steam_shared_secret" not in columns:
         cursor.execute("ALTER TABLE accounts ADD COLUMN steam_shared_secret TEXT")
         conn.commit()
+
+
+def ensure_rent_history_table():
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rent_history (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id      INTEGER NOT NULL,
+            steam_login     TEXT NOT NULL,
+            rent_package    TEXT NOT NULL,
+            started_at      TEXT NOT NULL,
+            planned_end_at  TEXT NOT NULL,
+            actual_end_at   TEXT,
+            close_reason    TEXT
+        )
+        """
+    )
+    conn.commit()
 
 
 def ensure_faceit_url_column():
@@ -614,6 +644,103 @@ def get_account_by_id(aid: int):
         (aid,),
     )
     return cursor.fetchone()
+
+
+def add_rent_history_entry(account_id: int, steam_login: str, rent_package: str, started_at: datetime, planned_end_at: datetime) -> None:
+    cursor.execute(
+        """
+        INSERT INTO rent_history (account_id, steam_login, rent_package, started_at, planned_end_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            account_id,
+            steam_login,
+            rent_package,
+            started_at.isoformat(),
+            planned_end_at.isoformat(),
+        ),
+    )
+
+
+def close_open_rent_history(account_id: int, actual_end_at: datetime, close_reason: str) -> None:
+    cursor.execute(
+        """
+        UPDATE rent_history
+           SET actual_end_at = ?,
+               close_reason = ?
+         WHERE id = (
+            SELECT id
+              FROM rent_history
+             WHERE account_id = ?
+               AND actual_end_at IS NULL
+             ORDER BY id DESC
+             LIMIT 1
+         )
+        """,
+        (actual_end_at.isoformat(), close_reason, account_id),
+    )
+
+
+def update_open_rent_history_planned_end(account_id: int, new_planned_end_at: datetime) -> None:
+    cursor.execute(
+        """
+        UPDATE rent_history
+           SET planned_end_at = ?
+         WHERE id = (
+            SELECT id
+              FROM rent_history
+             WHERE account_id = ?
+               AND actual_end_at IS NULL
+             ORDER BY id DESC
+             LIMIT 1
+         )
+        """,
+        (new_planned_end_at.isoformat(), account_id),
+    )
+
+
+def get_rent_history(account_id: int, limit: int = 10) -> list[tuple]:
+    cursor.execute(
+        """
+        SELECT started_at, planned_end_at, actual_end_at, rent_package, close_reason
+          FROM rent_history
+         WHERE account_id = ?
+         ORDER BY id DESC
+         LIMIT ?
+        """,
+        (account_id, limit),
+    )
+    return cursor.fetchall()
+
+
+def format_rent_history_text(steam_login: str, rows: list[tuple]) -> str:
+    if not rows:
+        return f"История аренд для {steam_login} пока пустая."
+
+    lines = [f"История аренд: {steam_login}", ""]
+    for idx, (started_at_raw, planned_end_raw, actual_end_raw, rent_package, close_reason) in enumerate(rows, start=1):
+        started_at = parse_iso_datetime(started_at_raw)
+        planned_end = parse_iso_datetime(planned_end_raw)
+        actual_end = parse_iso_datetime(actual_end_raw)
+
+        package_label = "Steam + Faceit" if rent_package == "steam_faceit" else "Steam only"
+        start_text = started_at.strftime("%d.%m %H:%M") if started_at else "-"
+        planned_text = planned_end.strftime("%d.%m %H:%M") if planned_end else "-"
+
+        if actual_end:
+            end_text = actual_end.strftime("%d.%m %H:%M")
+            reason_map = {
+                "manual_free": "завершена вручную",
+                "auto_free": "завершена автоматически",
+                "deleted": "завершена при удалении аккаунта",
+            }
+            status_text = reason_map.get(close_reason or "", "завершена")
+            lines.append(f"{idx}. {start_text} - {end_text} | {package_label} | {status_text}")
+        else:
+            left_text = format_remaining_time(planned_end) if planned_end else "неизвестно"
+            lines.append(f"{idx}. {start_text} - {planned_text} | {package_label} | активна ({left_text})")
+
+    return "\n".join(lines)
 
 
 def set_account_block(aid: int, target: str, ends_at: datetime | None, reason: str | None = None, block_type: str | None = None, source: str | None = None) -> None:
@@ -1387,6 +1514,7 @@ def detail_actions_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="Код Steam"), KeyboardButton(text="Код Faceit")],
             [KeyboardButton(text="Блокировка Faceit"), KeyboardButton(text="Блокировка Steam")],
+            [KeyboardButton(text="История аренд")],
             [KeyboardButton(text="Редактировать"), KeyboardButton(text="Удалить")],
             [KeyboardButton(text="Назад")],
         ],
@@ -1610,6 +1738,7 @@ def restore_database_from_file(backup_path: str) -> None:
     ensure_faceit_url_column()
     ensure_faceit_block_columns()
     ensure_steam_block_columns()
+    ensure_rent_history_table()
     migrate_encryption()
 
 # ────────────────────────────────────────────────
@@ -1947,6 +2076,17 @@ async def account_detail_action(message: types.Message, state: FSMContext):
             reply_markup=block_actions_kb()
         )
 
+    if txt == "история аренд":
+        if not row:
+            await state.clear()
+            return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+        history_rows = get_rent_history(aid, limit=10)
+        return await message.answer(
+            format_rent_history_text(row[0], history_rows),
+            reply_markup=detail_actions_kb()
+        )
+
     if txt != "редактировать":
         if txt == "удалить":
             if not row:
@@ -1966,7 +2106,7 @@ async def account_detail_action(message: types.Message, state: FSMContext):
                 reply_markup=delete_confirm_kb()
             )
 
-        return await message.answer("Нажмите «Редактировать», «Удалить» или «Назад».", reply_markup=detail_actions_kb())
+        return await message.answer("Выберите действие из кнопок ниже.", reply_markup=detail_actions_kb())
 
     if not aid:
         await state.clear()
@@ -2659,7 +2799,8 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
     login = data["selected_login"]
     rent_package = data.get("rent_package", "steam")
 
-    end = datetime.now() + delta
+    start_at = datetime.now()
+    end = start_at + delta
 
     try:
         cursor.execute(
@@ -2670,6 +2811,7 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
             conn.rollback()
             await message.answer("Аккаунт уже занят или удалён", reply_markup=main_menu)
         else:
+            add_rent_history_entry(aid, login, rent_package, start_at, end)
             conn.commit()
             await message.answer(
                 f"Аккаунт **{login}** сдан до {end.strftime('%d.%m %H:%M')}",
@@ -2755,6 +2897,7 @@ async def free_select(message: types.Message, state: FSMContext):
 
     try:
         cursor.execute("UPDATE accounts SET status='free', rent_end=NULL WHERE id=?", (aid,))
+        close_open_rent_history(aid, datetime.now(), "manual_free")
         conn.commit()
         await message.answer(f"Аккаунт {login} освобождён", reply_markup=main_menu)
     except Exception as e:
@@ -2842,6 +2985,7 @@ async def extend_confirm(message: types.Message, state: FSMContext):
             conn.rollback()
             await message.answer("Аккаунт уже свободен или удалён", reply_markup=main_menu)
         else:
+            update_open_rent_history_planned_end(aid, new_end)
             conn.commit()
             await message.answer(
                 f"Аккаунт **{login}** продлён до {new_end.strftime('%d.%m %H:%M')}",
@@ -2879,6 +3023,7 @@ async def checker_loop():
                             await bot.send_message(admin_id, f"⚠️ {row[1]} — ~5 минут до конца")
                     if left <= 0:
                         cursor.execute("UPDATE accounts SET status='free', rent_end=NULL WHERE id=?", (row[0],))
+                        close_open_rent_history(row[0], datetime.now(), "auto_free")
                         conn.commit()
                         for admin_id in ADMIN_IDS:
                             await bot.send_message(admin_id, f"✅ {row[1]} освобождён автоматически")
@@ -2917,6 +3062,7 @@ async def checker_loop():
 async def main():
     global FACEIT_API_KEY
     ensure_faceit_url_column()
+    ensure_rent_history_table()
     ensure_faceit_block_columns()
     ensure_steam_block_columns()
     ensure_faceit_2fa_column()
