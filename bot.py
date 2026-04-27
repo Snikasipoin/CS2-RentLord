@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import struct
 import time
+import random
 
 import aiohttp
 from dotenv import load_dotenv, dotenv_values
@@ -254,9 +255,58 @@ def set_funpay_auto_raise_enabled(enabled: bool) -> None:
     set_setting_raw("funpay_auto_raise_enabled", "1" if enabled else "0")
 
 
+def _schedule_next_funpay_auto_raise(now_ts: float, mode: str = "normal") -> int:
+    global FUNPAY_AUTO_RAISE_NEXT_RUN_TS
+
+    if mode == "warmup":
+        delay = random.randint(
+            FUNPAY_AUTO_RAISE_WARMUP_MIN_SECONDS,
+            FUNPAY_AUTO_RAISE_WARMUP_MAX_SECONDS,
+        )
+    elif mode == "error":
+        delay = random.randint(
+            FUNPAY_AUTO_RAISE_ERROR_BACKOFF_MIN_SECONDS,
+            FUNPAY_AUTO_RAISE_ERROR_BACKOFF_MAX_SECONDS,
+        )
+    else:
+        raw_delay = FUNPAY_AUTO_RAISE_INTERVAL_SECONDS + random.randint(
+            -FUNPAY_AUTO_RAISE_JITTER_SECONDS,
+            FUNPAY_AUTO_RAISE_JITTER_SECONDS,
+        )
+        delay = max(1800, raw_delay)
+
+    FUNPAY_AUTO_RAISE_NEXT_RUN_TS = now_ts + delay
+    return delay
+
+
+def _clear_funpay_auto_raise_schedule() -> None:
+    global FUNPAY_AUTO_RAISE_NEXT_RUN_TS, FUNPAY_AUTO_RAISE_ROTATION_OFFSET
+    FUNPAY_AUTO_RAISE_NEXT_RUN_TS = 0.0
+    FUNPAY_AUTO_RAISE_ROTATION_OFFSET = 0
+
+
+def get_funpay_next_auto_raise_in() -> str:
+    if FUNPAY_AUTO_RAISE_NEXT_RUN_TS <= 0:
+        return "не запланирован"
+
+    try:
+        now_ts = asyncio.get_running_loop().time()
+    except RuntimeError:
+        now_ts = time.monotonic()
+    left = max(0, int(FUNPAY_AUTO_RAISE_NEXT_RUN_TS - now_ts))
+    return format_interval_seconds(left)
+
+
 def funpay_toggle_auto_raise() -> bool:
+    global FUNPAY_AUTO_RAISE_LAST_RUN
     new_value = not get_funpay_auto_raise_enabled()
     set_funpay_auto_raise_enabled(new_value)
+    now_ts = asyncio.get_running_loop().time()
+    if new_value:
+        _schedule_next_funpay_auto_raise(now_ts, "warmup")
+    else:
+        _clear_funpay_auto_raise_schedule()
+    FUNPAY_AUTO_RAISE_LAST_RUN = 0.0
     logging.info("FunPay auto raise toggled to %s", new_value)
     return new_value
 
@@ -283,7 +333,17 @@ cursor = conn.cursor()
 DB_MAINTENANCE = False
 FUNPAY_OP_LOCK: asyncio.Lock | None = None
 FUNPAY_AUTO_RAISE_LAST_RUN = 0.0
+FUNPAY_AUTO_RAISE_NEXT_RUN_TS = 0.0
+FUNPAY_AUTO_RAISE_ROTATION_OFFSET = 0
 FUNPAY_AUTO_RAISE_INTERVAL_SECONDS = 3600
+FUNPAY_AUTO_RAISE_JITTER_SECONDS = 900
+FUNPAY_AUTO_RAISE_ERROR_BACKOFF_MIN_SECONDS = 1200
+FUNPAY_AUTO_RAISE_ERROR_BACKOFF_MAX_SECONDS = 2700
+FUNPAY_AUTO_RAISE_WARMUP_MIN_SECONDS = 480
+FUNPAY_AUTO_RAISE_WARMUP_MAX_SECONDS = 1500
+FUNPAY_AUTO_RAISE_MAX_CATEGORIES_PER_RUN = 3
+FUNPAY_AUTO_RAISE_REQUEST_PAUSE_MIN_SECONDS = 2.0
+FUNPAY_AUTO_RAISE_REQUEST_PAUSE_MAX_SECONDS = 6.0
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS accounts (
@@ -1258,13 +1318,31 @@ def _funpay_fetch_balance_sync(golden_key: str, user_agent: str | None = None) -
     }
 
 
-def _funpay_raise_all_lots_sync(golden_key: str, user_agent: str | None = None) -> dict:
+def _funpay_raise_all_lots_sync(
+    golden_key: str,
+    user_agent: str | None = None,
+    max_categories_per_run: int | None = None,
+    rotation_offset: int = 0,
+    pause_min_seconds: float = 0.0,
+    pause_max_seconds: float = 0.0,
+) -> dict:
     acc = _funpay_build_account_sync(golden_key, user_agent)
     categories = acc.get_sorted_categories() or {}
+    category_items = list(categories.items())
+    total_categories = len(category_items)
+
+    if total_categories:
+        safe_offset = rotation_offset % total_categories
+        if safe_offset:
+            category_items = category_items[safe_offset:] + category_items[:safe_offset]
+
+    if max_categories_per_run and max_categories_per_run > 0:
+        category_items = category_items[:max_categories_per_run]
 
     raised = []
     errors = []
-    for category_id, category in categories.items():
+    processed_categories = 0
+    for index, (category_id, category) in enumerate(category_items):
         cid = None
         try:
             cid = int(category_id)
@@ -1282,12 +1360,24 @@ def _funpay_raise_all_lots_sync(golden_key: str, user_agent: str | None = None) 
                 "category_name": getattr(category, "name", str(category_id)),
                 "result": result,
             })
+            processed_categories += 1
         except Exception as e:
             errors.append(f"{getattr(category, 'name', category_id)}: {e}")
+        finally:
+            if (
+                index < len(category_items) - 1
+                and pause_max_seconds > 0
+                and pause_max_seconds >= pause_min_seconds
+            ):
+                time.sleep(random.uniform(max(0.0, pause_min_seconds), pause_max_seconds))
 
     return {
         "username": getattr(acc, "username", None),
         "id": getattr(acc, "id", None),
+        "total_categories": total_categories,
+        "selected_categories": len(category_items),
+        "processed_categories": processed_categories,
+        "rotation_offset": rotation_offset,
         "raised": raised,
         "errors": errors,
     }
@@ -1307,6 +1397,7 @@ async def funpay_get_balance() -> dict:
 
 
 async def funpay_raise_all_lots() -> dict:
+    global FUNPAY_AUTO_RAISE_ROTATION_OFFSET
     golden_key = resolve_funpay_golden_key()
     if not golden_key:
         return {"error": "FunPay golden key не задан"}
@@ -1314,7 +1405,22 @@ async def funpay_raise_all_lots() -> dict:
     user_agent = resolve_funpay_user_agent()
     async with get_funpay_op_lock():
         try:
-            return await asyncio.to_thread(_funpay_raise_all_lots_sync, golden_key, user_agent)
+            result = await asyncio.to_thread(
+                _funpay_raise_all_lots_sync,
+                golden_key,
+                user_agent,
+                FUNPAY_AUTO_RAISE_MAX_CATEGORIES_PER_RUN,
+                FUNPAY_AUTO_RAISE_ROTATION_OFFSET,
+                FUNPAY_AUTO_RAISE_REQUEST_PAUSE_MIN_SECONDS,
+                FUNPAY_AUTO_RAISE_REQUEST_PAUSE_MAX_SECONDS,
+            )
+            total_categories = int(result.get("total_categories") or 0)
+            selected_categories = int(result.get("selected_categories") or 0)
+            if total_categories > 0 and selected_categories > 0:
+                FUNPAY_AUTO_RAISE_ROTATION_OFFSET = (
+                    FUNPAY_AUTO_RAISE_ROTATION_OFFSET + selected_categories
+                ) % total_categories
+            return result
         except Exception as e:
             return {"error": str(e)}
 
@@ -2757,12 +2863,15 @@ async def status_menu_actions(message: types.Message, state: FSMContext):
 def funpay_status_text() -> str:
     golden_key = resolve_funpay_golden_key()
     user_agent = resolve_funpay_user_agent()
-    auto_raise = "включён" if get_funpay_auto_raise_enabled() else "выключен"
+    auto_enabled = get_funpay_auto_raise_enabled()
+    auto_raise = "включён" if auto_enabled else "выключен"
+    next_raise = get_funpay_next_auto_raise_in() if auto_enabled and golden_key else "не запланирован"
     return (
         f"FunPayAPI: {'установлена' if FunPayAccount else 'не установлена'}\n"
         f"FunPay Golden Key: {'установлен' if golden_key else 'не установлен'}\n"
         f"FunPay User-Agent: {'установлен' if user_agent else 'не установлен'}\n"
-        f"Автоподъём лотов: {auto_raise}"
+        f"Автоподъём лотов: {auto_raise}\n"
+        f"Следующий автоподъём: {next_raise}"
     )
 
 
@@ -2807,8 +2916,11 @@ async def funpay_menu_actions(message: types.Message, state: FSMContext):
     if txt.startswith("автоподъём") or txt.startswith("автоподъем"):
         new_value = await funpay_toggle_auto_raise()
         status = "включён" if new_value else "выключен"
+        extra = ""
+        if new_value:
+            extra = f"\nСледующий автоподъём через: {get_funpay_next_auto_raise_in()}"
         return await message.answer(
-            f"Автоподъём лотов {status}.",
+            f"Автоподъём лотов {status}.{extra}",
             reply_markup=funpay_settings_kb()
         )
 
@@ -3150,34 +3262,51 @@ async def checker_loop():
 
             if get_funpay_auto_raise_enabled():
                 golden_key = resolve_funpay_golden_key()
-                if golden_key and now_ts - FUNPAY_AUTO_RAISE_LAST_RUN >= FUNPAY_AUTO_RAISE_INTERVAL_SECONDS:
-                    raise_result = await funpay_raise_all_lots()
-                    if raise_result.get("error"):
-                        logging.error("FunPay auto raise error: %s", raise_result["error"])
-                        for admin_id in ADMIN_IDS:
-                            await bot.send_message(
-                                admin_id,
-                                "⚠️ Автоподъем лотов FunPay завершился с ошибкой:\n"
-                                f"{raise_result['error']}"
+                if golden_key:
+                    if FUNPAY_AUTO_RAISE_NEXT_RUN_TS <= 0:
+                        _schedule_next_funpay_auto_raise(now_ts, "warmup")
+
+                    if now_ts >= FUNPAY_AUTO_RAISE_NEXT_RUN_TS:
+                        raise_result = await funpay_raise_all_lots()
+                        if raise_result.get("error"):
+                            logging.error("FunPay auto raise error: %s", raise_result["error"])
+                            next_delay = _schedule_next_funpay_auto_raise(now_ts, "error")
+                            next_in = format_interval_seconds(next_delay)
+                            for admin_id in ADMIN_IDS:
+                                await bot.send_message(
+                                    admin_id,
+                                    "⚠️ Автоподъем лотов FunPay завершился с ошибкой:\n"
+                                    f"{raise_result['error']}\n"
+                                    f"Повторная попытка через: {next_in}"
+                                )
+                        else:
+                            next_delay = _schedule_next_funpay_auto_raise(now_ts, "normal")
+                            next_in = format_interval_seconds(next_delay)
+                            raised_count = len(raise_result.get("raised", []))
+                            errors_count = len(raise_result.get("errors", []))
+                            selected_categories = int(raise_result.get("selected_categories") or 0)
+                            total_categories = int(raise_result.get("total_categories") or 0)
+                            logging.info(
+                                "FunPay auto raise completed: raised=%d errors=%d selected=%d total=%d",
+                                raised_count,
+                                errors_count,
+                                selected_categories,
+                                total_categories,
                             )
-                    else:
-                        next_in = format_interval_seconds(FUNPAY_AUTO_RAISE_INTERVAL_SECONDS)
-                        raised_count = len(raise_result.get("raised", []))
-                        errors_count = len(raise_result.get("errors", []))
-                        logging.info(
-                            "FunPay auto raise completed: raised=%d errors=%d",
-                            raised_count,
-                            errors_count,
-                        )
-                        for admin_id in ADMIN_IDS:
-                            await bot.send_message(
-                                admin_id,
-                                "✅ Произошел автоподъем лотов FunPay.\n"
-                                f"Поднято категорий: {raised_count}\n"
-                                f"Ошибок: {errors_count}\n"
-                                f"Следующий автоподъем через: {next_in}"
-                            )
-                    FUNPAY_AUTO_RAISE_LAST_RUN = now_ts
+                            for admin_id in ADMIN_IDS:
+                                await bot.send_message(
+                                    admin_id,
+                                    "✅ Произошел автоподъем лотов FunPay.\n"
+                                    f"Обработано категорий: {selected_categories} из {total_categories}\n"
+                                    f"Успешно поднято: {raised_count}\n"
+                                    f"Ошибок: {errors_count}\n"
+                                    f"Следующий автоподъем через: {next_in}"
+                                )
+                        FUNPAY_AUTO_RAISE_LAST_RUN = now_ts
+                else:
+                    _clear_funpay_auto_raise_schedule()
+            else:
+                _clear_funpay_auto_raise_schedule()
         except Exception as e:
             logging.error(f"checker_loop: {e}")
         await asyncio.sleep(30)
