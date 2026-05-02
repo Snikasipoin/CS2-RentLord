@@ -5,6 +5,7 @@ import os
 import shutil
 import tempfile
 import re
+import json
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, unquote, parse_qs
 import base64
@@ -444,6 +445,33 @@ def ensure_steam_shared_secret_column():
         conn.commit()
 
 
+def ensure_steam_trade_columns():
+    cursor.execute("PRAGMA table_info(accounts)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    additions = [
+        ("steam_identity_secret", "TEXT"),
+        ("steam_device_id", "TEXT"),
+        ("steam_mafile_name", "TEXT"),
+        ("steam_session_id", "TEXT"),
+        ("steam_login_cookie", "TEXT"),
+        ("steam_login_secure_cookie", "TEXT"),
+        ("steam_webcookie", "TEXT"),
+        ("steam_steamid64", "TEXT"),
+        ("steam_access_token", "TEXT"),
+        ("steam_refresh_token", "TEXT"),
+    ]
+
+    changed = False
+    for column_name, column_def in additions:
+        if column_name not in columns:
+            cursor.execute(f"ALTER TABLE accounts ADD COLUMN {column_name} {column_def}")
+            changed = True
+
+    if changed:
+        conn.commit()
+
+
 def ensure_rent_history_table():
     cursor.execute(
         """
@@ -470,10 +498,22 @@ def ensure_faceit_url_column():
         conn.commit()
 
 def migrate_encryption():
-    cursor.execute("SELECT id, steam_password, email_password, faceit_password, faceit_2fa_secret, steam_shared_secret FROM accounts")
+    cursor.execute(
+        """
+        SELECT id, steam_password, email_password, faceit_password,
+               faceit_2fa_secret, steam_shared_secret, steam_identity_secret,
+               steam_session_id, steam_login_cookie, steam_login_secure_cookie, steam_webcookie,
+               steam_access_token, steam_refresh_token
+          FROM accounts
+        """
+    )
     updated = False
     for row in cursor.fetchall():
-        aid, sp, ep, fp, secret, steam_secret = row
+        (
+            aid, sp, ep, fp, secret, steam_secret, steam_identity_secret,
+            steam_session_id, steam_login_cookie, steam_login_secure_cookie, steam_webcookie,
+            steam_access_token, steam_refresh_token
+        ) = row
         if sp and not sp.startswith("gAAAA"):
             cursor.execute("UPDATE accounts SET steam_password=? WHERE id=?", (encrypt(sp), aid))
             updated = True
@@ -488,6 +528,27 @@ def migrate_encryption():
             updated = True
         if steam_secret and not steam_secret.startswith("gAAAA"):
             cursor.execute("UPDATE accounts SET steam_shared_secret=? WHERE id=?", (encrypt(steam_secret), aid))
+            updated = True
+        if steam_identity_secret and not steam_identity_secret.startswith("gAAAA"):
+            cursor.execute("UPDATE accounts SET steam_identity_secret=? WHERE id=?", (encrypt(steam_identity_secret), aid))
+            updated = True
+        if steam_session_id and not steam_session_id.startswith("gAAAA"):
+            cursor.execute("UPDATE accounts SET steam_session_id=? WHERE id=?", (encrypt(steam_session_id), aid))
+            updated = True
+        if steam_login_cookie and not steam_login_cookie.startswith("gAAAA"):
+            cursor.execute("UPDATE accounts SET steam_login_cookie=? WHERE id=?", (encrypt(steam_login_cookie), aid))
+            updated = True
+        if steam_login_secure_cookie and not steam_login_secure_cookie.startswith("gAAAA"):
+            cursor.execute("UPDATE accounts SET steam_login_secure_cookie=? WHERE id=?", (encrypt(steam_login_secure_cookie), aid))
+            updated = True
+        if steam_webcookie and not steam_webcookie.startswith("gAAAA"):
+            cursor.execute("UPDATE accounts SET steam_webcookie=? WHERE id=?", (encrypt(steam_webcookie), aid))
+            updated = True
+        if steam_access_token and not steam_access_token.startswith("gAAAA"):
+            cursor.execute("UPDATE accounts SET steam_access_token=? WHERE id=?", (encrypt(steam_access_token), aid))
+            updated = True
+        if steam_refresh_token and not steam_refresh_token.startswith("gAAAA"):
+            cursor.execute("UPDATE accounts SET steam_refresh_token=? WHERE id=?", (encrypt(steam_refresh_token), aid))
             updated = True
     if updated:
         conn.commit()
@@ -527,12 +588,17 @@ class AccountDetails(StatesGroup):
 class EditAccount(StatesGroup):
     choose_field = State()
     enter_value = State()
+    wait_mafile = State()
 
 class DeleteAccount(StatesGroup):
     confirm = State()
 
 class BlockAccount(StatesGroup):
     menu = State()
+
+class TradeMenu(StatesGroup):
+    menu = State()
+    wait_mafile = State()
 
 class DataBackup(StatesGroup):
     choose_action = State()
@@ -699,7 +765,17 @@ def get_account_by_id(aid: int):
                steam_block_type,
                steam_block_source,
                faceit_2fa_secret,
-               steam_shared_secret
+               steam_shared_secret,
+               steam_identity_secret,
+               steam_device_id,
+               steam_mafile_name,
+               steam_session_id,
+               steam_login_cookie,
+               steam_login_secure_cookie,
+               steam_webcookie,
+               steam_steamid64,
+               steam_access_token,
+               steam_refresh_token
           FROM accounts
          WHERE id = ?
         """,
@@ -1010,12 +1086,281 @@ def generate_steam_guard_code(shared_secret: str) -> tuple[str, int]:
     return code, seconds_left
 
 
+def build_steam_device_id(steam_id: str | int | None) -> str | None:
+    if steam_id is None:
+        return None
+
+    value = str(steam_id).strip()
+    if not value or not value.isdigit():
+        return None
+
+    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()
+    return (
+        "android:"
+        f"{digest[:8]}-"
+        f"{digest[8:12]}-"
+        f"{digest[12:16]}-"
+        f"{digest[16:20]}-"
+        f"{digest[20:32]}"
+    )
+
+
+def parse_steam_mafile_content(raw_text: str) -> dict:
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        raise ValueError("Файл не является корректным JSON.") from e
+
+    if not isinstance(payload, dict):
+        raise ValueError("maFile должен содержать JSON-объект.")
+
+    session = payload.get("Session") if isinstance(payload.get("Session"), dict) else {}
+    shared_secret = normalize_steam_secret(payload.get("shared_secret"))
+    identity_secret = normalize_steam_secret(payload.get("identity_secret"))
+    steam_id = session.get("SteamID") or payload.get("steamid")
+    device_id = payload.get("device_id") or build_steam_device_id(steam_id)
+
+    if not shared_secret:
+        raise ValueError("В maFile не найден shared_secret.")
+
+    return {
+        "shared_secret": shared_secret,
+        "identity_secret": identity_secret,
+        "steam_id": str(steam_id).strip() if steam_id is not None else None,
+        "device_id": device_id,
+        "session_id": (session.get("SessionID") or "").strip() or None,
+        "steam_login_cookie": (session.get("SteamLogin") or "").strip() or None,
+        "steam_login_secure_cookie": (session.get("SteamLoginSecure") or "").strip() or None,
+        "webcookie": (session.get("WebCookie") or "").strip() or None,
+        "access_token": (session.get("AccessToken") or "").strip() or None,
+        "refresh_token": (session.get("RefreshToken") or "").strip() or None,
+    }
+
+
 def parse_faceit_ban_end(item: dict) -> datetime | None:
     for key in ("ends_at", "banEnd", "ban_end", "endsAt"):
         dt = parse_iso_datetime(item.get(key))
         if dt is not None:
             return dt
     return None
+
+
+def generate_steam_confirmation_key(identity_secret: str, tag: str, timestamp: int) -> str:
+    normalized = normalize_steam_secret(identity_secret)
+    if not normalized:
+        raise ValueError("Пустой identity secret")
+
+    padding = "=" * (-len(normalized) % 4)
+    secret = base64.b64decode(normalized + padding)
+    buffer = struct.pack(">Q", timestamp) + tag.encode("ascii")
+    digest = hmac.new(secret, buffer, hashlib.sha1).digest()
+    return base64.b64encode(digest).decode()
+
+
+def build_steam_confirmation_params(identity_secret: str, steam_id64: str, device_id: str, tag: str) -> dict:
+    timestamp = int(time.time())
+    return {
+        "p": device_id,
+        "a": steam_id64,
+        "k": generate_steam_confirmation_key(identity_secret, tag, timestamp),
+        "t": str(timestamp),
+        "m": "android",
+        "tag": tag,
+    }
+
+
+def extract_steam_confirmations_from_html(html: str) -> list[dict]:
+    if not html:
+        return []
+
+    entries = []
+    entry_pattern = re.compile(
+        r'(<div[^>]+class="mobileconf_list_entry[^"]*"[^>]+data-confid="(?P<confid>\d+)"[^>]+data-key="(?P<key>[^"]+)"[^>]*>.*?</div>\s*</div>)',
+        re.IGNORECASE | re.DOTALL,
+    )
+    desc_pattern = re.compile(r'<div[^>]*class="mobileconf_list_entry_description"[^>]*>(.*?)</div>', re.IGNORECASE | re.DOTALL)
+    line_pattern = re.compile(r"<div[^>]*>(.*?)</div>", re.IGNORECASE | re.DOTALL)
+
+    for match in entry_pattern.finditer(html):
+        block = match.group(1) or ""
+        desc_block_match = desc_pattern.search(block)
+        desc_block = desc_block_match.group(1) if desc_block_match else ""
+        text_lines = [
+            re.sub(r"<.*?>", "", item).strip()
+            for item in line_pattern.findall(desc_block)
+        ]
+        text_lines = [unquote(item) for item in text_lines if item]
+        title = text_lines[0] if text_lines else "Без названия"
+        details = text_lines[1] if len(text_lines) > 1 else ""
+        entries.append(
+            {
+                "id": match.group("confid"),
+                "nonce": match.group("key"),
+                "title": title,
+                "details": details,
+            }
+        )
+
+    return entries
+
+
+def build_steam_confirmation_cookies(row) -> dict:
+    steam_id64 = (row[31] if len(row) > 31 else None) or ""
+    session_id = decrypt(row[27]) if len(row) > 27 and row[27] else None
+    steam_login = decrypt(row[28]) if len(row) > 28 and row[28] else None
+    steam_login_secure = decrypt(row[29]) if len(row) > 29 and row[29] else None
+    webcookie = decrypt(row[30]) if len(row) > 30 and row[30] else None
+
+    cookies = {
+        "steamid": steam_id64,
+        "sessionid": session_id or "",
+        "steamLogin": steam_login or "",
+        "steamLoginSecure": steam_login_secure or "",
+        "mobileClient": "android",
+        "mobileClientVersion": "777777 3.0.0",
+        "Steam_Language": "russian",
+    }
+    if webcookie:
+        cookies["webTradeEligibility"] = webcookie
+    return {k: v for k, v in cookies.items() if v}
+
+
+def steam_trade_ready(row) -> bool:
+    if not row or len(row) <= 33:
+        return False
+    has_base = bool(row[23] and row[24] and row[25] and row[31])
+    has_cookie_session = bool(row[27] and row[29])
+    return has_base and has_cookie_session
+
+
+def steam_token_session_ready(row) -> bool:
+    if not row or len(row) <= 33:
+        return False
+    return bool(row[23] and row[24] and row[25] and row[31] and row[32] and row[33])
+
+
+def steam_session_mode(row) -> str:
+    if steam_trade_ready(row):
+        return "cookie"
+    if steam_token_session_ready(row):
+        return "token"
+    return "partial"
+
+
+def save_steam_mafile_to_account(aid: int, filename: str, raw_text: str) -> None:
+    parsed = parse_steam_mafile_content(raw_text)
+    cursor.execute(
+        """
+        UPDATE accounts
+           SET steam_shared_secret = ?,
+               steam_identity_secret = ?,
+               steam_device_id = ?,
+               steam_mafile_name = ?,
+               steam_session_id = ?,
+               steam_login_cookie = ?,
+               steam_login_secure_cookie = ?,
+               steam_webcookie = ?,
+               steam_steamid64 = ?,
+               steam_access_token = ?,
+               steam_refresh_token = ?
+         WHERE id = ?
+        """,
+        (
+            encrypt(parsed["shared_secret"]) if parsed.get("shared_secret") else None,
+            encrypt(parsed["identity_secret"]) if parsed.get("identity_secret") else None,
+            parsed.get("device_id"),
+            filename,
+            encrypt(parsed["session_id"]) if parsed.get("session_id") else None,
+            encrypt(parsed["steam_login_cookie"]) if parsed.get("steam_login_cookie") else None,
+            encrypt(parsed["steam_login_secure_cookie"]) if parsed.get("steam_login_secure_cookie") else None,
+            encrypt(parsed["webcookie"]) if parsed.get("webcookie") else None,
+            parsed.get("steam_id"),
+            encrypt(parsed["access_token"]) if parsed.get("access_token") else None,
+            encrypt(parsed["refresh_token"]) if parsed.get("refresh_token") else None,
+            aid,
+        ),
+    )
+
+
+async def steam_fetch_confirmations(aid: int, row) -> dict:
+    if steam_token_session_ready(row) and not steam_trade_ready(row):
+        return {
+            "error": (
+                "Загружен новый token-based maFile Steam "
+                "(AccessToken/RefreshToken), но для подтверждений "
+                "в Python-версии бота пока всё ещё нужна cookie-сессия "
+                "(SessionID и SteamLoginSecure)."
+            )
+        }
+    if not steam_trade_ready(row):
+        return {"error": "Для подтверждений не хватает данных из maFile: identity secret, device id или Steam cookies."}
+
+    identity_secret = decrypt(row[24])
+    device_id = row[25]
+    steam_id64 = row[31]
+    params = build_steam_confirmation_params(identity_secret, steam_id64, device_id, "conf")
+    cookies = build_steam_confirmation_cookies(row)
+
+    try:
+        async with aiohttp.ClientSession(cookies=cookies) as session:
+            async with session.get("https://steamcommunity.com/mobileconf/getlist", params=params, timeout=30) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    return {"error": f"Steam вернул HTTP {resp.status}: {text[:200]}"}
+                payload = await resp.json(content_type=None)
+    except Exception as e:
+        return {"error": str(e)}
+
+    if not payload.get("success"):
+        message = payload.get("message") or "Steam не подтвердил запрос."
+        return {"error": message}
+
+    html = payload.get("html") or ""
+    confirmations = extract_steam_confirmations_from_html(html)
+    return {"confirmations": confirmations}
+
+
+async def steam_send_confirmation_multi(aid: int, row, op: str, confirmations: list[dict]) -> dict:
+    if not confirmations:
+        return {"error": "Нет подтверждений для обработки."}
+    if steam_token_session_ready(row) and not steam_trade_ready(row):
+        return {
+            "error": (
+                "Загружен новый token-based maFile Steam "
+                "(AccessToken/RefreshToken), но массовые действия "
+                "по подтверждениям в Python-версии бота пока ещё ожидают "
+                "cookie-сессию Steam."
+            )
+        }
+    if not steam_trade_ready(row):
+        return {"error": "Для обработки подтверждений не хватает данных из maFile."}
+
+    identity_secret = decrypt(row[24])
+    device_id = row[25]
+    steam_id64 = row[31]
+    params = build_steam_confirmation_params(identity_secret, steam_id64, device_id, "conf")
+    cookies = build_steam_confirmation_cookies(row)
+    data = {
+        "op": op,
+        "cid[]": [item["id"] for item in confirmations],
+        "ck[]": [item["nonce"] for item in confirmations],
+    }
+
+    try:
+        async with aiohttp.ClientSession(cookies=cookies) as session:
+            async with session.post("https://steamcommunity.com/mobileconf/multiajaxop", params=params, data=data, timeout=30) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    return {"error": f"Steam вернул HTTP {resp.status}: {text[:200]}"}
+                payload = await resp.json(content_type=None)
+    except Exception as e:
+        return {"error": str(e)}
+
+    if not payload.get("success"):
+        message = payload.get("message") or "Steam не выполнил действие."
+        return {"error": message}
+
+    return {"success": True, "count": len(confirmations)}
 
 
 def parse_faceit_ban_start(item: dict) -> datetime | None:
@@ -1653,6 +1998,15 @@ async def build_account_details_text(row) -> str:
     steam_block_source = rest[12] if len(rest) > 12 else None
     faceit_2fa_secret = rest[13] if len(rest) > 13 else None
     steam_shared_secret = rest[14] if len(rest) > 14 else None
+    steam_identity_secret = rest[15] if len(rest) > 15 else None
+    steam_device_id = rest[16] if len(rest) > 16 else None
+    steam_mafile_name = rest[17] if len(rest) > 17 else None
+    steam_session_id = rest[18] if len(rest) > 18 else None
+    steam_login_secure_cookie = rest[20] if len(rest) > 20 else None
+    steam_steamid64 = rest[22] if len(rest) > 22 else None
+    steam_access_token = rest[23] if len(rest) > 23 else None
+    steam_refresh_token = rest[24] if len(rest) > 24 else None
+    session_mode = steam_session_mode(row)
 
     details_lines = [
         f"Данные аккаунта: {s_login}",
@@ -1691,7 +2045,18 @@ async def build_account_details_text(row) -> str:
         "",
         "Steam Guard:",
         f"  Статус: {'подключён' if steam_shared_secret else 'не настроен'}",
+        f"  Трейды: {'готово' if steam_trade_ready(row) else ('токены загружены' if steam_token_session_ready(row) else 'не настроены')}",
     ])
+    if steam_mafile_name:
+        details_lines.append(f"  maFile: {steam_mafile_name}")
+    if steam_session_id or steam_login_secure_cookie or steam_steamid64 or steam_access_token or steam_refresh_token:
+        if session_mode == "cookie":
+            session_text = "cookie-сессия готова"
+        elif session_mode == "token":
+            session_text = "token-сессия загружена"
+        else:
+            session_text = "сессия загружена частично"
+        details_lines.append(f"  Сессия Steam: {session_text}")
 
     append_block_section(
         details_lines,
@@ -1728,7 +2093,7 @@ def detail_actions_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="Код Steam"), KeyboardButton(text="Код Faceit")],
             [KeyboardButton(text="Блокировка Faceit"), KeyboardButton(text="Блокировка Steam")],
-            [KeyboardButton(text="История аренд")],
+            [KeyboardButton(text="Трейд"), KeyboardButton(text="История аренд")],
             [KeyboardButton(text="Редактировать"), KeyboardButton(text="Удалить")],
             [KeyboardButton(text="Назад")],
         ],
@@ -1746,6 +2111,22 @@ def block_actions_kb() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True
     )
+
+
+def trade_actions_kb(has_mafile: bool) -> ReplyKeyboardMarkup:
+    clear_row = [KeyboardButton(text="Очистить maFile")] if has_mafile else [KeyboardButton(text="Назад")]
+
+    keyboard = [
+        [KeyboardButton(text="Показать подтверждения Steam")],
+        [KeyboardButton(text="Подтвердить все"), KeyboardButton(text="Отклонить все")],
+    ]
+    if has_mafile:
+        keyboard.append(clear_row)
+        keyboard.append([KeyboardButton(text="Назад")])
+    else:
+        keyboard.append(clear_row)
+
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
 def rent_mode_kb() -> ReplyKeyboardMarkup:
@@ -1781,6 +2162,58 @@ def copy_buffer_kb(copy_text: str, button_text: str = "Скопировать в
             [InlineKeyboardButton(text=button_text, copy_text=CopyTextButton(text=value))]
         ]
     )
+
+
+def build_trade_menu_text(row) -> str:
+    steam_shared_secret = row[23] if len(row) > 23 else None
+    steam_identity_secret = row[24] if len(row) > 24 else None
+    steam_device_id = row[25] if len(row) > 25 else None
+    steam_mafile_name = row[26] if len(row) > 26 else None
+    steam_session_id = row[27] if len(row) > 27 else None
+    steam_login_secure_cookie = row[29] if len(row) > 29 else None
+    steam_steamid64 = row[31] if len(row) > 31 else None
+    steam_access_token = row[32] if len(row) > 32 else None
+    steam_refresh_token = row[33] if len(row) > 33 else None
+
+    shared_ready = bool(steam_shared_secret)
+    trade_ready = steam_trade_ready(row)
+    token_ready = steam_token_session_ready(row)
+    session_mode = steam_session_mode(row)
+
+    lines = [
+        f"Трейд-меню: {row[0]}",
+        "",
+        f"Steam Guard вход: {'настроен' if shared_ready else 'не настроен'}",
+        f"Трейд-подтверждения: {'готовы' if trade_ready else ('токены загружены' if token_ready else 'не настроены')}",
+        f"Identity secret: {'есть' if steam_identity_secret else 'нет'}",
+        f"Device ID: {'есть' if steam_device_id else 'нет'}",
+        f"SteamID64: {'есть' if steam_steamid64 else 'нет'}",
+        f"Session ID: {'есть' if steam_session_id else 'нет'}",
+        f"SteamLoginSecure: {'есть' if steam_login_secure_cookie else 'нет'}",
+        f"AccessToken: {'есть' if steam_access_token else 'нет'}",
+        f"RefreshToken: {'есть' if steam_refresh_token else 'нет'}",
+        f"maFile: {steam_mafile_name or 'не загружен'}",
+    ]
+
+    if not steam_mafile_name:
+        lines.extend([
+            "",
+            "Для подготовки трейдов загрузите maFile аккаунта.",
+        ])
+    elif not trade_ready:
+        if session_mode == "token":
+            lines.extend([
+                "",
+                "maFile загружен в новом token-формате Steam.",
+                "Токены сохранены, но текущая логика подтверждений ещё ожидает cookie-сессию Steam.",
+            ])
+        else:
+            lines.extend([
+                "",
+                "maFile загружен, но в нём не хватает данных для трейд-подтверждений.",
+            ])
+
+    return "\n".join(lines)
 
 
 def delete_confirm_kb() -> ReplyKeyboardMarkup:
@@ -1852,7 +2285,8 @@ def edit_fields_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Steam логин"), KeyboardButton(text="Steam пароль")],
-            [KeyboardButton(text="Steam shared secret")],
+            [KeyboardButton(text="Steam shared secret"), KeyboardButton(text="Steam identity secret")],
+            [KeyboardButton(text="Загрузить maFile")],
             [KeyboardButton(text="Email"), KeyboardButton(text="Пароль email")],
             [KeyboardButton(text="Faceit ссылка"), KeyboardButton(text="Faceit email")],
             [KeyboardButton(text="Пароль Faceit"), KeyboardButton(text="Faceit 2FA secret")],
@@ -1953,6 +2387,7 @@ def restore_database_from_file(backup_path: str) -> None:
     ensure_faceit_block_columns()
     ensure_steam_block_columns()
     ensure_rent_history_table()
+    ensure_steam_trade_columns()
     migrate_encryption()
 
 # ────────────────────────────────────────────────
@@ -2214,12 +2649,23 @@ async def account_detail_action(message: types.Message, state: FSMContext):
     data = await state.get_data()
     aid = data.get("selected_id")
     row = get_account_by_id(aid) if aid else None
-    faceit_2fa_secret = row[-2] if row and len(row) >= 2 else None
-    steam_shared_secret = row[-1] if row else None
+    faceit_2fa_secret = row[22] if row and len(row) > 22 else None
+    steam_shared_secret = row[23] if row and len(row) > 23 else None
 
     if txt == "назад":
         await state.clear()
         return await render_accounts_list(message, state)
+
+    if txt == "трейд":
+        if not row:
+            await state.clear()
+            return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+        await state.set_state(TradeMenu.menu)
+        return await message.answer(
+            build_trade_menu_text(row),
+            reply_markup=trade_actions_kb(bool(row[26] if len(row) > 26 else None))
+        )
 
     if txt in {"steam код", "код steam", "код стим"}:
         if not row:
@@ -2389,6 +2835,253 @@ async def block_account_action(message: types.Message, state: FSMContext):
     await state.set_state(AccountDetails.view_action)
     updated = get_account_by_id(aid)
     return await message.answer(await build_account_details_text(updated or row), reply_markup=detail_actions_kb())
+
+
+@dp.message(StateFilter(TradeMenu.menu))
+async def trade_menu_action(message: types.Message, state: FSMContext):
+    txt = (message.text or "").strip().lower()
+    data = await state.get_data()
+    aid = data.get("selected_id")
+
+    if not aid:
+        await state.clear()
+        return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+    row = get_account_by_id(aid)
+    if not row:
+        await state.clear()
+        return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+    has_mafile = bool(row[26] if len(row) > 26 else None)
+
+    if txt == "назад":
+        await state.set_state(AccountDetails.view_action)
+        return await message.answer(await build_account_details_text(row), reply_markup=detail_actions_kb())
+
+    if txt == "очистить mafile":
+        try:
+            cursor.execute(
+                """
+                UPDATE accounts
+                   SET steam_shared_secret = NULL,
+                       steam_identity_secret = NULL,
+                       steam_device_id = NULL,
+                       steam_mafile_name = NULL,
+                       steam_session_id = NULL,
+                       steam_login_cookie = NULL,
+                       steam_login_secure_cookie = NULL,
+                       steam_webcookie = NULL,
+                       steam_steamid64 = NULL,
+                       steam_access_token = NULL,
+                       steam_refresh_token = NULL
+                 WHERE id = ?
+                """,
+                (aid,),
+            )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"clear mafile error: {e}")
+            return await message.answer(
+                "Не удалось очистить данные maFile.",
+                reply_markup=trade_actions_kb(has_mafile)
+            )
+
+        updated = get_account_by_id(aid)
+        return await message.answer(
+            build_trade_menu_text(updated or row),
+            reply_markup=trade_actions_kb(False)
+        )
+
+    if txt == "показать подтверждения steam":
+        result = await steam_fetch_confirmations(aid, row)
+        if result.get("error"):
+            return await message.answer(
+                f"Не удалось получить подтверждения Steam:\n{result['error']}",
+                reply_markup=trade_actions_kb(has_mafile)
+            )
+
+        confirmations = result.get("confirmations", [])
+        if not confirmations:
+            return await message.answer(
+                "Активных подтверждений Steam сейчас нет.",
+                reply_markup=trade_actions_kb(has_mafile)
+            )
+
+        lines = [f"Активных подтверждений Steam: {len(confirmations)}", ""]
+        for index, item in enumerate(confirmations[:15], start=1):
+            details = item.get("details") or "-"
+            lines.append(f"{index}. {item.get('title') or 'Без названия'}")
+            lines.append(f"   {details}")
+
+        if len(confirmations) > 15:
+            lines.extend(["", f"Показаны первые 15 из {len(confirmations)} подтверждений."])
+
+        return await message.answer("\n".join(lines), reply_markup=trade_actions_kb(has_mafile))
+
+    if txt == "подтвердить все":
+        fetch_result = await steam_fetch_confirmations(aid, row)
+        if fetch_result.get("error"):
+            return await message.answer(
+                f"Не удалось получить подтверждения перед подтверждением:\n{fetch_result['error']}",
+                reply_markup=trade_actions_kb(has_mafile)
+            )
+
+        confirmations = fetch_result.get("confirmations", [])
+        action_result = await steam_send_confirmation_multi(aid, row, "allow", confirmations)
+        if action_result.get("error"):
+            return await message.answer(
+                f"Не удалось подтвердить трейды:\n{action_result['error']}",
+                reply_markup=trade_actions_kb(has_mafile)
+            )
+
+        return await message.answer(
+            f"Подтверждено Steam-подтверждений: {action_result.get('count', 0)}",
+            reply_markup=trade_actions_kb(has_mafile)
+        )
+
+    if txt == "отклонить все":
+        fetch_result = await steam_fetch_confirmations(aid, row)
+        if fetch_result.get("error"):
+            return await message.answer(
+                f"Не удалось получить подтверждения перед отклонением:\n{fetch_result['error']}",
+                reply_markup=trade_actions_kb(has_mafile)
+            )
+
+        confirmations = fetch_result.get("confirmations", [])
+        action_result = await steam_send_confirmation_multi(aid, row, "cancel", confirmations)
+        if action_result.get("error"):
+            return await message.answer(
+                f"Не удалось отклонить трейды:\n{action_result['error']}",
+                reply_markup=trade_actions_kb(has_mafile)
+            )
+
+        return await message.answer(
+            f"Отклонено Steam-подтверждений: {action_result.get('count', 0)}",
+            reply_markup=trade_actions_kb(has_mafile)
+        )
+
+    return await message.answer(
+        "Выберите действие из меню трейдов.",
+        reply_markup=trade_actions_kb(has_mafile)
+    )
+
+
+@dp.message(StateFilter(TradeMenu.wait_mafile))
+async def trade_menu_wait_mafile(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    aid = data.get("selected_id")
+
+    if not aid:
+        await state.clear()
+        return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+    if (message.text or "").strip().lower() == "отмена":
+        row = get_account_by_id(aid)
+        await state.set_state(TradeMenu.menu)
+        if not row:
+            await state.clear()
+            return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+        return await message.answer(
+            build_trade_menu_text(row),
+            reply_markup=trade_actions_kb(bool(row[26] if len(row) > 26 else None))
+        )
+
+    if not message.document:
+        return await message.answer("Нужно отправить именно maFile документом.", reply_markup=cancel_kb)
+
+    filename = message.document.file_name or "steam.maFile"
+    if not filename.lower().endswith((".mafile", ".json", ".txt")):
+        return await message.answer("Поддерживаются файлы `.maFile`, `.json` или `.txt`.", reply_markup=cancel_kb)
+
+    temp_dir = tempfile.mkdtemp(prefix="steam_mafile_", dir=BACKUP_DIR)
+    temp_path = os.path.join(temp_dir, filename)
+
+    try:
+        await bot.download(message.document, destination=temp_path)
+        with open(temp_path, "r", encoding="utf-8-sig") as f:
+            save_steam_mafile_to_account(aid, filename, f.read())
+        if cursor.rowcount == 0:
+            conn.rollback()
+            await state.clear()
+            return await message.answer("Аккаунт не найден или уже удалён.", reply_markup=main_menu)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"mafile import error: {e}")
+        return await message.answer(
+            f"Не удалось обработать maFile: {e}",
+            reply_markup=cancel_kb
+        )
+    finally:
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    row = get_account_by_id(aid)
+    if not row:
+        await state.clear()
+        return await message.answer("Данные сохранены, но аккаунт не найден для повторного открытия.", reply_markup=main_menu)
+
+    await state.set_state(TradeMenu.menu)
+    return await message.answer(
+        "maFile успешно загружен. Steam Guard и трейд-секреты сохранены.",
+        reply_markup=trade_actions_kb(True)
+    )
+
+
+@dp.message(StateFilter(EditAccount.wait_mafile))
+async def edit_wait_mafile(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    aid = data.get("selected_id")
+
+    if not aid:
+        await state.clear()
+        return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+    if not message.document:
+        return await message.answer("Нужно отправить именно maFile документом.", reply_markup=cancel_kb)
+
+    filename = message.document.file_name or "steam.maFile"
+    if not filename.lower().endswith((".mafile", ".json", ".txt")):
+        return await message.answer("Поддерживаются файлы `.maFile`, `.json` или `.txt`.", reply_markup=cancel_kb)
+
+    temp_dir = tempfile.mkdtemp(prefix="steam_mafile_edit_", dir=BACKUP_DIR)
+    temp_path = os.path.join(temp_dir, filename)
+
+    try:
+        await bot.download(message.document, destination=temp_path)
+        with open(temp_path, "r", encoding="utf-8-sig") as f:
+            save_steam_mafile_to_account(aid, filename, f.read())
+
+        if cursor.rowcount == 0:
+            conn.rollback()
+            await state.clear()
+            return await message.answer("Аккаунт не найден или уже удалён.", reply_markup=main_menu)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"mafile edit import error: {e}")
+        return await message.answer(
+            f"Не удалось обработать maFile: {e}",
+            reply_markup=cancel_kb
+        )
+    finally:
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    row = get_account_by_id(aid)
+    if not row:
+        await state.clear()
+        return await message.answer("Данные сохранены, но аккаунт не найден для повторного открытия.", reply_markup=main_menu)
+
+    await state.update_data(selected_login=row[0])
+    await state.set_state(AccountDetails.view_action)
+    await message.answer("maFile успешно загружен через редактирование аккаунта.", reply_markup=detail_actions_kb())
+    await message.answer(await build_account_details_text(row), reply_markup=detail_actions_kb())
 
 
 @dp.message(StateFilter(DeleteAccount.confirm))
@@ -2696,7 +3389,16 @@ async def edit_choose_field(message: types.Message, state: FSMContext):
         "пароль faceit": ("faceit_password", "Пароль Faceit", True),
         "faceit 2fa secret": ("faceit_2fa_secret", "Faceit 2FA secret", True),
         "steam shared secret": ("steam_shared_secret", "Steam shared secret", True),
+        "steam identity secret": ("steam_identity_secret", "Steam identity secret", True),
     }
+
+    if txt == "загрузить mafile":
+        await state.set_state(EditAccount.wait_mafile)
+        return await message.answer(
+            "Отправьте maFile документом в формате JSON. Бот сам извлечёт Steam Guard и трейд-данные.",
+            reply_markup=cancel_kb
+        )
+
     field = field_map.get(txt)
     if field is None:
         return await message.answer("Выберите поле из списка.", reply_markup=edit_fields_kb())
@@ -2735,12 +3437,18 @@ async def edit_enter_value(message: types.Message, state: FSMContext):
             return await message.answer("Значение не может быть пустым.", reply_markup=cancel_kb)
         new_value = value
 
+    if new_value is not None and field in {"steam_shared_secret", "steam_identity_secret"}:
+        normalized_secret = normalize_steam_secret(new_value)
+        if not normalized_secret:
+            return await message.answer("Не удалось распознать secret. Проверьте формат значения.", reply_markup=cancel_kb)
+        new_value = normalized_secret
+
     if field == "steam_login":
         cursor.execute("SELECT 1 FROM accounts WHERE steam_login = ? AND id <> ?", (new_value, aid))
         if cursor.fetchone():
             return await message.answer("Такой Steam логин уже существует.", reply_markup=cancel_kb)
 
-    stored_value = encrypt(new_value) if field in {"steam_password", "email_password", "faceit_password", "faceit_2fa_secret", "steam_shared_secret"} and new_value is not None else new_value
+    stored_value = encrypt(new_value) if field in {"steam_password", "email_password", "faceit_password", "faceit_2fa_secret", "steam_shared_secret", "steam_identity_secret"} and new_value is not None else new_value
 
     try:
         cursor.execute(f"UPDATE accounts SET {field} = ? WHERE id = ?", (stored_value, aid))
@@ -2914,7 +3622,7 @@ async def funpay_menu_actions(message: types.Message, state: FSMContext):
         return await message.answer(text, reply_markup=funpay_settings_kb())
 
     if txt.startswith("автоподъём") or txt.startswith("автоподъем"):
-        new_value = await funpay_toggle_auto_raise()
+        new_value = funpay_toggle_auto_raise()
         status = "включён" if new_value else "выключен"
         extra = ""
         if new_value:
@@ -3323,6 +4031,7 @@ async def main():
     ensure_steam_block_columns()
     ensure_faceit_2fa_column()
     ensure_steam_shared_secret_column()
+    ensure_steam_trade_columns()
     migrate_encryption()
     FACEIT_API_KEY = resolve_faceit_api_key()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
