@@ -14,6 +14,7 @@ import hmac
 import struct
 import time
 import random
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from dotenv import load_dotenv, dotenv_values
@@ -31,6 +32,11 @@ try:
 except Exception:
     FunPayAccount = None
     FunPayEnums = None
+
+try:
+    LOCAL_TIMEZONE = ZoneInfo("Asia/Omsk")
+except Exception:
+    LOCAL_TIMEZONE = timezone.utc
 
 # ────────────────────────────────────────────────
 #  Настройки и шифрование
@@ -515,6 +521,26 @@ def ensure_steam_presence_columns():
         conn.commit()
 
 
+def ensure_account_note_columns():
+    cursor.execute("PRAGMA table_info(accounts)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    additions = [
+        ("account_note", "TEXT"),
+        ("weekly_drop_claimed_period", "TEXT"),
+        ("weekly_drop_claimed_at", "TEXT"),
+    ]
+
+    changed = False
+    for column_name, column_def in additions:
+        if column_name not in columns:
+            cursor.execute(f"ALTER TABLE accounts ADD COLUMN {column_name} {column_def}")
+            changed = True
+
+    if changed:
+        conn.commit()
+
+
 def ensure_rent_history_table():
     cursor.execute(
         """
@@ -627,6 +653,9 @@ class FreeAccount(StatesGroup):
 class AccountDetails(StatesGroup):
     select_account = State()
     view_action = State()
+
+class AccountDrop(StatesGroup):
+    menu = State()
 
 class EditAccount(StatesGroup):
     choose_field = State()
@@ -824,7 +853,10 @@ def get_account_by_id(aid: int):
                steam_refresh_token,
                steam_presence_state,
                steam_presence_game,
-               steam_presence_checked_at
+               steam_presence_checked_at,
+               account_note,
+               weekly_drop_claimed_period,
+               weekly_drop_claimed_at
           FROM accounts
          WHERE id = ?
         """,
@@ -927,6 +959,120 @@ def format_rent_history_text(steam_login: str, rows: list[tuple]) -> str:
             left_text = format_remaining_time(planned_end) if planned_end else "неизвестно"
             lines.append(f"{idx}. {start_text} - {planned_text} | {package_label} | активна ({left_text})")
 
+    return "\n".join(lines)
+
+
+def get_current_drop_period_start(now: datetime | None = None) -> str:
+    current = now or datetime.now(LOCAL_TIMEZONE)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=LOCAL_TIMEZONE)
+    else:
+        current = current.astimezone(LOCAL_TIMEZONE)
+
+    days_since_wednesday = (current.weekday() - 2) % 7
+    period_start = (current - timedelta(days=days_since_wednesday)).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    return period_start.date().isoformat()
+
+
+def get_weekly_drop_status(row) -> tuple[bool, str | None, str | None]:
+    claimed_period = None
+    claimed_at = None
+    if row and len(row) > 39:
+        claimed_period = row[38]
+        claimed_at = row[39]
+
+    current_period = get_current_drop_period_start()
+    return claimed_period == current_period, claimed_period, claimed_at
+
+
+def set_weekly_drop_claimed(aid: int, claimed: bool) -> None:
+    current_period = get_current_drop_period_start()
+    cursor.execute(
+        """
+        UPDATE accounts
+           SET weekly_drop_claimed_period = ?,
+               weekly_drop_claimed_at = ?
+         WHERE id = ?
+        """,
+        (
+            current_period if claimed else None,
+            datetime.now(timezone.utc).isoformat() if claimed else None,
+            aid,
+        ),
+    )
+
+
+def format_weekly_drop_label(row) -> str:
+    claimed, _, _ = get_weekly_drop_status(row)
+    if claimed:
+        return "🟢 еженедельный дроп забран"
+    return "🔴 еженедельный дроп не забран"
+
+
+def get_next_drop_reset(now: datetime | None = None) -> datetime:
+    current = now or datetime.now(LOCAL_TIMEZONE)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=LOCAL_TIMEZONE)
+    else:
+        current = current.astimezone(LOCAL_TIMEZONE)
+
+    days_until_wednesday = (2 - current.weekday()) % 7
+    next_reset = (current + timedelta(days=days_until_wednesday)).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if next_reset <= current:
+        next_reset += timedelta(days=7)
+    return next_reset
+
+
+def format_account_note_preview(note: str | None) -> str:
+    if not note:
+        return "нет"
+
+    normalized = " ".join(str(note).split())
+    if len(normalized) <= 180:
+        return normalized
+    return normalized[:177] + "..."
+
+
+def build_weekly_drop_menu_text(row) -> str:
+    login = row[0] if row else "-"
+    claimed, claimed_period, claimed_at = get_weekly_drop_status(row)
+    claimed_at_dt = parse_iso_datetime(claimed_at)
+    current_period = get_current_drop_period_start()
+    current_period_text = datetime.fromisoformat(current_period).strftime("%d.%m.%Y")
+    next_reset = get_next_drop_reset()
+
+    lines = [
+        f"Еженедельный дроп: {login}",
+        "",
+        f"Статус: {'🟢 забран' if claimed else '🔴 не забран'}",
+        f"Текущий период: {current_period_text}",
+        f"Сбросится автоматически: {next_reset.astimezone(LOCAL_TIMEZONE).strftime('%d.%m.%Y %H:%M')}",
+    ]
+
+    if claimed_period and claimed_period != current_period:
+        try:
+            claimed_period_text = datetime.fromisoformat(claimed_period).strftime("%d.%m.%Y")
+        except Exception:
+            claimed_period_text = claimed_period
+        lines.append(f"Последняя отметка: {claimed_period_text}")
+
+    if claimed_at_dt:
+        lines.append(f"Отметка поставлена: {claimed_at_dt.astimezone(LOCAL_TIMEZONE).strftime('%d.%m.%Y %H:%M')}")
+
+    lines.extend([
+        "",
+        "Здесь можно вручную отметить, что недельный дроп забран.",
+    ])
     return "\n".join(lines)
 
 
@@ -2247,6 +2393,8 @@ async def build_account_details_text(row) -> str:
     steam_mafile_name = rest[17] if len(rest) > 17 else None
     steam_presence_state = rest[25] if len(rest) > 25 else None
     steam_presence_game = rest[26] if len(rest) > 26 else None
+    steam_presence_checked_at = rest[27] if len(rest) > 27 else None
+    account_note = rest[28] if len(rest) > 28 else None
 
     details_lines = [
         f"Данные аккаунта: {s_login}",
@@ -2290,6 +2438,19 @@ async def build_account_details_text(row) -> str:
     if steam_mafile_name:
         details_lines.append(f"  maFile: {steam_mafile_name}")
 
+    details_lines.extend([
+        "",
+        "Заметка:",
+        f"  {format_account_note_preview(account_note)}",
+        f"Еженедельный дроп: {format_weekly_drop_label(row)}",
+    ])
+    if steam_presence_checked_at:
+        checked_at_dt = parse_iso_datetime(steam_presence_checked_at)
+        if checked_at_dt:
+            details_lines.append(
+                f"Steam статус обновлён: {checked_at_dt.astimezone(LOCAL_TIMEZONE).strftime('%d.%m.%Y %H:%M')}"
+            )
+
     append_block_section(
         details_lines,
         "Faceit",
@@ -2325,8 +2486,19 @@ def detail_actions_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="Код Steam"), KeyboardButton(text="Код Faceit")],
             [KeyboardButton(text="Блокировка Faceit"), KeyboardButton(text="Блокировка Steam")],
-            [KeyboardButton(text="История аренд")],
+            [KeyboardButton(text="История аренд"), KeyboardButton(text="Дроп")],
             [KeyboardButton(text="Редактировать"), KeyboardButton(text="Удалить")],
+            [KeyboardButton(text="Назад")],
+        ],
+        resize_keyboard=True
+    )
+
+
+def drop_actions_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Забрал дроп")],
+            [KeyboardButton(text="Сбросить отметку")],
             [KeyboardButton(text="Назад")],
         ],
         resize_keyboard=True
@@ -2530,6 +2702,7 @@ def edit_fields_kb() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="Steam логин"), KeyboardButton(text="Steam пароль")],
             [KeyboardButton(text="Steam shared secret"), KeyboardButton(text="Steam identity secret")],
             [KeyboardButton(text="SteamID64"), KeyboardButton(text="Загрузить maFile")],
+            [KeyboardButton(text="Заметка")],
             [KeyboardButton(text="Email"), KeyboardButton(text="Пароль email")],
             [KeyboardButton(text="Faceit ссылка"), KeyboardButton(text="Faceit email")],
             [KeyboardButton(text="Пароль Faceit"), KeyboardButton(text="Faceit 2FA secret")],
@@ -2915,6 +3088,17 @@ async def account_detail_action(message: types.Message, state: FSMContext):
             reply_markup=detail_actions_kb()
         )
 
+    if txt == "дроп":
+        if not row:
+            await state.clear()
+            return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+        await state.set_state(AccountDrop.menu)
+        return await message.answer(
+            build_weekly_drop_menu_text(row),
+            reply_markup=drop_actions_kb()
+        )
+
     if txt in {"steam код", "код steam", "код стим"}:
         if not row:
             await state.clear()
@@ -3022,6 +3206,60 @@ async def account_detail_action(message: types.Message, state: FSMContext):
 
     await state.set_state(EditAccount.choose_field)
     await message.answer("Что изменить?", reply_markup=edit_fields_kb())
+
+
+@dp.message(StateFilter(AccountDrop.menu))
+async def account_drop_action(message: types.Message, state: FSMContext):
+    txt = (message.text or "").strip().lower()
+    data = await state.get_data()
+    aid = data.get("selected_id")
+
+    if not aid:
+        await state.clear()
+        return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+    row = get_account_by_id(aid)
+    if not row:
+        await state.clear()
+        return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+    if txt == "назад":
+        await state.set_state(AccountDetails.view_action)
+        return await message.answer(await build_account_details_text(row), reply_markup=detail_actions_kb())
+
+    if txt == "забрал дроп":
+        try:
+            set_weekly_drop_claimed(aid, True)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"weekly drop mark error: {e}")
+            return await message.answer("Не удалось сохранить отметку о дропе.", reply_markup=drop_actions_kb())
+
+        updated = get_account_by_id(aid)
+        await state.set_state(AccountDrop.menu)
+        return await message.answer(
+            build_weekly_drop_menu_text(updated or row),
+            reply_markup=drop_actions_kb()
+        )
+
+    if txt == "сбросить отметку":
+        try:
+            set_weekly_drop_claimed(aid, False)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"weekly drop reset error: {e}")
+            return await message.answer("Не удалось сбросить отметку о дропе.", reply_markup=drop_actions_kb())
+
+        updated = get_account_by_id(aid)
+        await state.set_state(AccountDrop.menu)
+        return await message.answer(
+            build_weekly_drop_menu_text(updated or row),
+            reply_markup=drop_actions_kb()
+        )
+
+    return await message.answer("Выберите действие из кнопок ниже.", reply_markup=drop_actions_kb())
 
 
 @dp.message(StateFilter(BlockAccount.menu))
@@ -3694,6 +3932,7 @@ async def edit_choose_field(message: types.Message, state: FSMContext):
         "steam логин": ("steam_login", "Steam логин", False),
         "steam пароль": ("steam_password", "Steam пароль", False),
         "steamid64": ("steam_steamid64", "SteamID64", True),
+        "заметка": ("account_note", "Заметка", True),
         "email": ("email", "Email", True),
         "пароль email": ("email_password", "Пароль email", True),
         "faceit ссылка": ("faceit_url", "Faceit ссылка", True),
@@ -3754,6 +3993,8 @@ async def edit_enter_value(message: types.Message, state: FSMContext):
         if not normalized_secret:
             return await message.answer("Не удалось распознать secret. Проверьте формат значения.", reply_markup=cancel_kb)
         new_value = normalized_secret
+    elif field == "account_note" and new_value is not None:
+        new_value = new_value.strip()
 
     if field == "steam_login":
         cursor.execute("SELECT 1 FROM accounts WHERE steam_login = ? AND id <> ?", (new_value, aid))
@@ -4368,6 +4609,7 @@ async def main():
     ensure_steam_shared_secret_column()
     ensure_steam_trade_columns()
     ensure_steam_presence_columns()
+    ensure_account_note_columns()
     migrate_encryption()
     FACEIT_API_KEY = resolve_faceit_api_key()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
