@@ -247,6 +247,29 @@ def resolve_funpay_user_agent() -> str:
     return get_funpay_user_agent_from_storage()
 
 
+def get_steam_api_key_from_storage() -> str:
+    raw_value = get_setting_raw("steam_api_key")
+    if raw_value:
+        try:
+            return decrypt(raw_value) or ""
+        except Exception:
+            return ""
+    return ""
+
+
+def set_steam_api_key(value: str | None) -> None:
+    if value is None or not value.strip():
+        set_setting_raw("steam_api_key", None)
+        logging.info("Steam API key removed from settings")
+    else:
+        set_setting_raw("steam_api_key", encrypt(value.strip()))
+        logging.info("Steam API key updated in settings")
+
+
+def resolve_steam_api_key() -> str:
+    return get_steam_api_key_from_storage()
+
+
 def get_funpay_auto_raise_enabled() -> bool:
     value = (get_setting_raw("funpay_auto_raise_enabled") or "").strip().lower()
     return value in {"1", "true", "yes", "on"}
@@ -472,6 +495,26 @@ def ensure_steam_trade_columns():
         conn.commit()
 
 
+def ensure_steam_presence_columns():
+    cursor.execute("PRAGMA table_info(accounts)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    additions = [
+        ("steam_presence_state", "TEXT"),
+        ("steam_presence_game", "TEXT"),
+        ("steam_presence_checked_at", "TEXT"),
+    ]
+
+    changed = False
+    for column_name, column_def in additions:
+        if column_name not in columns:
+            cursor.execute(f"ALTER TABLE accounts ADD COLUMN {column_name} {column_def}")
+            changed = True
+
+    if changed:
+        conn.commit()
+
+
 def ensure_rent_history_table():
     cursor.execute(
         """
@@ -605,6 +648,8 @@ class DataBackup(StatesGroup):
     restore_wait_file = State()
     faceit_api_menu = State()
     faceit_api_wait_key = State()
+    steam_api_menu = State()
+    steam_api_wait_key = State()
     funpay_menu = State()
     funpay_wait_key = State()
     funpay_wait_user_agent = State()
@@ -644,6 +689,7 @@ main_menu = ReplyKeyboardMarkup(
 def status_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
+            [KeyboardButton(text="Статистика аренд")],
             [KeyboardButton(text="Проверка блокировок Faceit")],
             [KeyboardButton(text="Назад")],
         ],
@@ -775,7 +821,10 @@ def get_account_by_id(aid: int):
                steam_webcookie,
                steam_steamid64,
                steam_access_token,
-               steam_refresh_token
+               steam_refresh_token,
+               steam_presence_state,
+               steam_presence_game,
+               steam_presence_checked_at
           FROM accounts
          WHERE id = ?
         """,
@@ -877,6 +926,84 @@ def format_rent_history_text(steam_login: str, rows: list[tuple]) -> str:
         else:
             left_text = format_remaining_time(planned_end) if planned_end else "неизвестно"
             lines.append(f"{idx}. {start_text} - {planned_text} | {package_label} | активна ({left_text})")
+
+    return "\n".join(lines)
+
+
+def get_rent_statistics_text() -> str:
+    cursor.execute(
+        """
+        SELECT steam_login, started_at, actual_end_at, rent_package, close_reason
+          FROM rent_history
+         ORDER BY id DESC
+        """
+    )
+    rows = cursor.fetchall()
+
+    now = datetime.now(timezone.utc)
+    total = len(rows)
+    active = 0
+    closed = 0
+    manual_closed = 0
+    auto_closed = 0
+    last_24h = 0
+    last_7d = 0
+    durations_minutes: list[int] = []
+    top_counts: dict[str, int] = {}
+
+    for steam_login, started_at_raw, actual_end_raw, rent_package, close_reason in rows:
+        started_at = parse_iso_datetime(started_at_raw)
+        actual_end = parse_iso_datetime(actual_end_raw)
+
+        top_counts[steam_login] = top_counts.get(steam_login, 0) + 1
+
+        if started_at and (now - started_at).total_seconds() <= 86400:
+            last_24h += 1
+        if started_at and (now - started_at).total_seconds() <= 604800:
+            last_7d += 1
+
+        if actual_end is None:
+            active += 1
+            continue
+
+        closed += 1
+        if close_reason == "manual_free":
+            manual_closed += 1
+        elif close_reason == "auto_free":
+            auto_closed += 1
+
+        if started_at:
+            duration_minutes = max(0, int((actual_end - started_at).total_seconds() / 60))
+            durations_minutes.append(duration_minutes)
+
+    top_rows = sorted(top_counts.items(), key=lambda item: (-item[1], item[0]))[:5]
+
+    avg_text = "нет данных"
+    if durations_minutes:
+        total_minutes = int(sum(durations_minutes) / len(durations_minutes))
+        avg_hours_part, avg_minutes_part = divmod(total_minutes, 60)
+        if avg_hours_part:
+            avg_text = f"{avg_hours_part}ч {avg_minutes_part}м"
+        else:
+            avg_text = f"{avg_minutes_part}м"
+
+    lines = [
+        "Статистика аренд:",
+        "",
+        f"Всего записей: {total}",
+        f"Активных сейчас: {active}",
+        f"Завершено: {closed}",
+        f"За 24 часа: {last_24h}",
+        f"За 7 дней: {last_7d}",
+        f"Средняя длительность завершённых: {avg_text}",
+        f"Завершено вручную: {manual_closed}",
+        f"Завершено автоматически: {auto_closed}",
+    ]
+
+    if top_rows:
+        lines.extend(["", "Топ аккаунтов:"])
+        for idx, (login, cnt) in enumerate(top_rows, start=1):
+            lines.append(f"{idx}. {login} — {cnt}")
 
     return "\n".join(lines)
 
@@ -1245,6 +1372,125 @@ def steam_session_mode(row) -> str:
     if steam_token_session_ready(row):
         return "token"
     return "partial"
+
+
+def format_steam_presence_label(state: str | None, game: str | None) -> str:
+    normalized = (state or "").strip().lower()
+    if normalized == "in_game":
+        return f"в игре ({game})" if game else "в игре"
+    if normalized == "online":
+        return "в сети"
+    if normalized == "offline":
+        return "не в игре"
+    if normalized == "hidden":
+        return "статус скрыт"
+    if normalized == "unknown":
+        return "статус неизвестен"
+    return "нет данных"
+
+
+async def fetch_steam_presence_batch(steam_api_key: str, steam_ids: list[str]) -> dict[str, dict]:
+    if not steam_api_key or not steam_ids:
+        return {}
+
+    url = "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
+    params = {
+        "key": steam_api_key,
+        "steamids": ",".join(steam_ids),
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params, timeout=30) as resp:
+            resp.raise_for_status()
+            payload = await resp.json(content_type=None)
+
+    players = ((payload or {}).get("response") or {}).get("players") or []
+    result: dict[str, dict] = {}
+
+    for player in players:
+        steam_id = str(player.get("steamid") or "").strip()
+        if not steam_id:
+            continue
+
+        game_name = player.get("gameextrainfo")
+        visibility = int(player.get("communityvisibilitystate") or 0)
+        persona_state = int(player.get("personastate") or 0)
+
+        if player.get("gameid"):
+            state = "in_game"
+        elif visibility and visibility < 3:
+            state = "hidden"
+        elif persona_state > 0:
+            state = "online"
+        else:
+            state = "offline"
+
+        result[steam_id] = {
+            "state": state,
+            "game": game_name or None,
+        }
+
+    return result
+
+
+async def sync_steam_presence() -> None:
+    steam_api_key = resolve_steam_api_key()
+    if not steam_api_key:
+        return
+
+    cursor.execute(
+        """
+        SELECT id, steam_steamid64
+          FROM accounts
+         WHERE steam_steamid64 IS NOT NULL
+           AND TRIM(steam_steamid64) != ''
+        """
+    )
+    rows = cursor.fetchall()
+    if not rows:
+        return
+
+    id_to_steamid: dict[int, str] = {}
+    steam_ids: list[str] = []
+    for aid, steam_id_raw in rows:
+        steam_id = str(steam_id_raw).strip()
+        if not steam_id:
+            continue
+        id_to_steamid[aid] = steam_id
+        steam_ids.append(steam_id)
+
+    if not steam_ids:
+        return
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    results: dict[str, dict] = {}
+
+    for start in range(0, len(steam_ids), 100):
+        batch = steam_ids[start:start + 100]
+        batch_result = await fetch_steam_presence_batch(steam_api_key, batch)
+        results.update(batch_result)
+
+    for aid, steam_id in id_to_steamid.items():
+        item = results.get(steam_id)
+        if item:
+            state = item.get("state") or "unknown"
+            game = item.get("game")
+        else:
+            state = "unknown"
+            game = None
+
+        cursor.execute(
+            """
+            UPDATE accounts
+               SET steam_presence_state = ?,
+                   steam_presence_game = ?,
+                   steam_presence_checked_at = ?
+             WHERE id = ?
+            """,
+            (state, game, now_iso, aid),
+        )
+
+    conn.commit()
 
 
 def save_steam_mafile_to_account(aid: int, filename: str, raw_text: str) -> None:
@@ -1998,19 +2244,14 @@ async def build_account_details_text(row) -> str:
     steam_block_source = rest[12] if len(rest) > 12 else None
     faceit_2fa_secret = rest[13] if len(rest) > 13 else None
     steam_shared_secret = rest[14] if len(rest) > 14 else None
-    steam_identity_secret = rest[15] if len(rest) > 15 else None
-    steam_device_id = rest[16] if len(rest) > 16 else None
     steam_mafile_name = rest[17] if len(rest) > 17 else None
-    steam_session_id = rest[18] if len(rest) > 18 else None
-    steam_login_secure_cookie = rest[20] if len(rest) > 20 else None
-    steam_steamid64 = rest[22] if len(rest) > 22 else None
-    steam_access_token = rest[23] if len(rest) > 23 else None
-    steam_refresh_token = rest[24] if len(rest) > 24 else None
-    session_mode = steam_session_mode(row)
+    steam_presence_state = rest[25] if len(rest) > 25 else None
+    steam_presence_game = rest[26] if len(rest) > 26 else None
 
     details_lines = [
         f"Данные аккаунта: {s_login}",
         f"Статус: {st}",
+        f"Steam статус: {format_steam_presence_label(steam_presence_state, steam_presence_game)}",
         "",
         "Steam:",
         f"  Логин: {s_login}",
@@ -2045,18 +2286,9 @@ async def build_account_details_text(row) -> str:
         "",
         "Steam Guard:",
         f"  Статус: {'подключён' if steam_shared_secret else 'не настроен'}",
-        f"  Трейды: {'готово' if steam_trade_ready(row) else ('токены загружены' if steam_token_session_ready(row) else 'не настроены')}",
     ])
     if steam_mafile_name:
         details_lines.append(f"  maFile: {steam_mafile_name}")
-    if steam_session_id or steam_login_secure_cookie or steam_steamid64 or steam_access_token or steam_refresh_token:
-        if session_mode == "cookie":
-            session_text = "cookie-сессия готова"
-        elif session_mode == "token":
-            session_text = "token-сессия загружена"
-        else:
-            session_text = "сессия загружена частично"
-        details_lines.append(f"  Сессия Steam: {session_text}")
 
     append_block_section(
         details_lines,
@@ -2093,7 +2325,7 @@ def detail_actions_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="Код Steam"), KeyboardButton(text="Код Faceit")],
             [KeyboardButton(text="Блокировка Faceit"), KeyboardButton(text="Блокировка Steam")],
-            [KeyboardButton(text="Трейд"), KeyboardButton(text="История аренд")],
+            [KeyboardButton(text="История аренд")],
             [KeyboardButton(text="Редактировать"), KeyboardButton(text="Удалить")],
             [KeyboardButton(text="Назад")],
         ],
@@ -2230,7 +2462,7 @@ def data_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Создать копию"), KeyboardButton(text="Загрузить копию")],
-            [KeyboardButton(text="FACEIT API")],
+            [KeyboardButton(text="FACEIT API"), KeyboardButton(text="STEAM API")],
             [KeyboardButton(text="FUNPAY")],
             [KeyboardButton(text="Назад")],
         ],
@@ -2239,6 +2471,17 @@ def data_menu_kb() -> ReplyKeyboardMarkup:
 
 
 def faceit_api_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Ввести/обновить ключ")],
+            [KeyboardButton(text="Удалить ключ")],
+            [KeyboardButton(text="Назад")],
+        ],
+        resize_keyboard=True
+    )
+
+
+def steam_api_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Ввести/обновить ключ")],
@@ -2286,7 +2529,7 @@ def edit_fields_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="Steam логин"), KeyboardButton(text="Steam пароль")],
             [KeyboardButton(text="Steam shared secret"), KeyboardButton(text="Steam identity secret")],
-            [KeyboardButton(text="Загрузить maFile")],
+            [KeyboardButton(text="SteamID64"), KeyboardButton(text="Загрузить maFile")],
             [KeyboardButton(text="Email"), KeyboardButton(text="Пароль email")],
             [KeyboardButton(text="Faceit ссылка"), KeyboardButton(text="Faceit email")],
             [KeyboardButton(text="Пароль Faceit"), KeyboardButton(text="Faceit 2FA secret")],
@@ -2388,6 +2631,7 @@ def restore_database_from_file(backup_path: str) -> None:
     ensure_steam_block_columns()
     ensure_rent_history_table()
     ensure_steam_trade_columns()
+    ensure_steam_presence_columns()
     migrate_encryption()
 
 # ────────────────────────────────────────────────
@@ -2563,7 +2807,10 @@ async def render_accounts_list(message: types.Message, state: FSMContext):
     await state.clear()
     cursor.execute(
         """
-        SELECT id, steam_login, status, rent_end, faceit_blocked, faceit_block_ends_at, steam_blocked, steam_block_ends_at
+        SELECT id, steam_login, status, rent_end,
+               faceit_blocked, faceit_block_ends_at,
+               steam_blocked, steam_block_ends_at,
+               steam_presence_state, steam_presence_game
           FROM accounts
          ORDER BY steam_login
         """
@@ -2575,7 +2822,7 @@ async def render_accounts_list(message: types.Message, state: FSMContext):
 
     lines = []
     rows_data = []
-    for aid, login, st, end, faceit_blocked, faceit_block_end, steam_blocked, steam_block_end in rows:
+    for aid, login, st, end, faceit_blocked, faceit_block_end, steam_blocked, steam_block_end, steam_presence_state, steam_presence_game in rows:
         rows_data.append({
             "id": aid,
             "login": login,
@@ -2585,6 +2832,8 @@ async def render_accounts_list(message: types.Message, state: FSMContext):
             "faceit_block_end": faceit_block_end,
             "steam_blocked": steam_blocked,
             "steam_block_end": steam_block_end,
+            "steam_presence_state": steam_presence_state,
+            "steam_presence_game": steam_presence_game,
         })
 
         has_blocks = bool(faceit_blocked) or bool(steam_blocked)
@@ -2606,6 +2855,10 @@ async def render_accounts_list(message: types.Message, state: FSMContext):
         if steam_blocked:
             block_dt = parse_iso_datetime(steam_block_end)
             parts.append("Steam " + (format_remaining_time(block_dt) if block_dt else "блокировка"))
+
+        presence_text = format_steam_presence_label(steam_presence_state, steam_presence_game)
+        if presence_text != "нет данных":
+            parts.append("Steam " + presence_text)
 
         lines.append(" | ".join(parts))
 
@@ -2657,14 +2910,9 @@ async def account_detail_action(message: types.Message, state: FSMContext):
         return await render_accounts_list(message, state)
 
     if txt == "трейд":
-        if not row:
-            await state.clear()
-            return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
-
-        await state.set_state(TradeMenu.menu)
         return await message.answer(
-            build_trade_menu_text(row),
-            reply_markup=trade_actions_kb(bool(row[26] if len(row) > 26 else None))
+            "Раздел трейдов скрыт из интерфейса и пока не используется в работе.",
+            reply_markup=detail_actions_kb()
         )
 
     if txt in {"steam код", "код steam", "код стим"}:
@@ -3191,6 +3439,15 @@ async def data_choose_action(message: types.Message, state: FSMContext):
             reply_markup=faceit_api_kb()
         )
 
+    if txt == "steam api":
+        current_key = resolve_steam_api_key()
+        status_text = "установлен" if current_key else "не установлен"
+        await state.set_state(DataBackup.steam_api_menu)
+        return await message.answer(
+            f"STEAM API ключ: {status_text}.",
+            reply_markup=steam_api_kb()
+        )
+
     if txt == "funpay":
         golden_key = resolve_funpay_golden_key()
         status_text = "установлен" if golden_key else "не установлен"
@@ -3282,6 +3539,60 @@ async def faceit_api_wait_key(message: types.Message, state: FSMContext):
     FACEIT_API_KEY = resolve_faceit_api_key()
     await state.set_state(DataBackup.faceit_api_menu)
     await message.answer("FACEIT API ключ сохранён и активирован.", reply_markup=faceit_api_kb())
+
+
+@dp.message(StateFilter(DataBackup.steam_api_menu))
+async def steam_api_menu(message: types.Message, state: FSMContext):
+    txt = (message.text or "").strip().lower()
+
+    if txt == "назад":
+        await state.clear()
+        return await message.answer("Возврат в меню.", reply_markup=main_menu)
+
+    if txt == "ввести/обновить ключ":
+        await state.set_state(DataBackup.steam_api_wait_key)
+        return await message.answer(
+            "Отправьте новый STEAM API ключ одним сообщением.",
+            reply_markup=cancel_kb
+        )
+
+    if txt == "удалить ключ":
+        set_steam_api_key(None)
+        await state.clear()
+        return await message.answer("STEAM API ключ удалён из базы.", reply_markup=main_menu)
+
+    current_key = resolve_steam_api_key()
+    status_text = "установлен" if current_key else "не установлен"
+    return await message.answer(
+        f"STEAM API ключ: {status_text}.",
+        reply_markup=steam_api_kb()
+    )
+
+
+@dp.message(StateFilter(DataBackup.steam_api_wait_key))
+async def steam_api_wait_key(message: types.Message, state: FSMContext):
+    key = (message.text or "").strip()
+
+    if key.lower() == "отмена":
+        await state.set_state(DataBackup.steam_api_menu)
+        return await message.answer("Ввод ключа отменён.", reply_markup=steam_api_kb())
+
+    if not key:
+        return await message.answer("Ключ не может быть пустым.", reply_markup=cancel_kb)
+
+    set_steam_api_key(key)
+    sync_error = None
+    try:
+        await sync_steam_presence()
+    except Exception as e:
+        sync_error = str(e)
+    await state.set_state(DataBackup.steam_api_menu)
+    text = "STEAM API ключ сохранён и активирован."
+    if sync_error:
+        text += f"\nПервичное обновление Steam-статусов не удалось: {sync_error}"
+    else:
+        text += "\nSteam-статусы обновлены."
+    await message.answer(text, reply_markup=steam_api_kb())
 
 
 @dp.message(StateFilter(DataBackup.funpay_menu))
@@ -3382,6 +3693,7 @@ async def edit_choose_field(message: types.Message, state: FSMContext):
     field_map = {
         "steam логин": ("steam_login", "Steam логин", False),
         "steam пароль": ("steam_password", "Steam пароль", False),
+        "steamid64": ("steam_steamid64", "SteamID64", True),
         "email": ("email", "Email", True),
         "пароль email": ("email_password", "Пароль email", True),
         "faceit ссылка": ("faceit_url", "Faceit ссылка", True),
@@ -3448,6 +3760,10 @@ async def edit_enter_value(message: types.Message, state: FSMContext):
         if cursor.fetchone():
             return await message.answer("Такой Steam логин уже существует.", reply_markup=cancel_kb)
 
+    if new_value is not None and field == "steam_steamid64":
+        if not str(new_value).isdigit():
+            return await message.answer("SteamID64 должен состоять только из цифр.", reply_markup=cancel_kb)
+
     stored_value = encrypt(new_value) if field in {"steam_password", "email_password", "faceit_password", "faceit_2fa_secret", "steam_shared_secret", "steam_identity_secret"} and new_value is not None else new_value
 
     try:
@@ -3464,6 +3780,12 @@ async def edit_enter_value(message: types.Message, state: FSMContext):
         conn.rollback()
         logging.error(f"edit error: {e}")
         return await message.answer("Ошибка сохранения изменений.", reply_markup=cancel_kb)
+
+    if field == "steam_steamid64" and resolve_steam_api_key():
+        try:
+            await sync_steam_presence()
+        except Exception as e:
+            logging.error(f"steam presence refresh after steamid edit: {e}")
 
     row = get_account_by_id(aid)
     if not row:
@@ -3515,6 +3837,11 @@ async def status_menu_actions(message: types.Message, state: FSMContext):
     if txt == "назад":
         await state.clear()
         return await message.answer("Возврат в меню.", reply_markup=main_menu)
+
+    if txt == "статистика аренд":
+        clean_invalid_dates()
+        text = get_rent_statistics_text()
+        return await message.answer(text, reply_markup=status_menu_kb())
 
     if txt == "проверка блокировок faceit":
         clean_expired_faceit_blocks()
@@ -3934,6 +4261,7 @@ async def extend_confirm(message: types.Message, state: FSMContext):
 
 async def checker_loop():
     last_faceit_scan = 0.0
+    last_steam_presence_scan = 0.0
     global FUNPAY_AUTO_RAISE_LAST_RUN
     while True:
         try:
@@ -3967,6 +4295,13 @@ async def checker_loop():
                     for admin_id in ADMIN_IDS:
                         await bot.send_message(admin_id, notification)
                 last_faceit_scan = now_ts
+
+            if now_ts - last_steam_presence_scan >= 180:
+                try:
+                    await sync_steam_presence()
+                except Exception as e:
+                    logging.error(f"steam_presence_sync: {e}")
+                last_steam_presence_scan = now_ts
 
             if get_funpay_auto_raise_enabled():
                 golden_key = resolve_funpay_golden_key()
@@ -4032,6 +4367,7 @@ async def main():
     ensure_faceit_2fa_column()
     ensure_steam_shared_secret_column()
     ensure_steam_trade_columns()
+    ensure_steam_presence_columns()
     migrate_encryption()
     FACEIT_API_KEY = resolve_faceit_api_key()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
