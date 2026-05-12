@@ -14,6 +14,7 @@ import hmac
 import struct
 import time
 import random
+import threading
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -28,9 +29,11 @@ from aiogram.fsm.context import FSMContext
 
 try:
     from FunPayAPI import Account as FunPayAccount
+    from FunPayAPI import Runner as FunPayRunner
     from FunPayAPI import enums as FunPayEnums
 except Exception:
     FunPayAccount = None
+    FunPayRunner = None
     FunPayEnums = None
 
 try:
@@ -224,6 +227,8 @@ def set_funpay_golden_key(value: str | None) -> None:
     else:
         set_setting_raw("funpay_golden_key", encrypt(value.strip()))
         logging.info("FunPay golden key updated in settings")
+        if MAIN_LOOP is not None and not FUNPAY_LISTENER_THREAD_STARTED:
+            start_funpay_listener(MAIN_LOOP)
 
 
 def resolve_funpay_golden_key() -> str:
@@ -362,6 +367,9 @@ conn = sqlite3.connect("accounts.db", check_same_thread=False)
 cursor = conn.cursor()
 DB_MAINTENANCE = False
 FUNPAY_OP_LOCK: asyncio.Lock | None = None
+MAIN_LOOP: asyncio.AbstractEventLoop | None = None
+FUNPAY_LISTENER_THREAD_STARTED = False
+FUNPAY_LISTENER_THREAD: threading.Thread | None = None
 FUNPAY_AUTO_RAISE_LAST_RUN = 0.0
 FUNPAY_AUTO_RAISE_NEXT_RUN_TS = 0.0
 FUNPAY_AUTO_RAISE_ROTATION_OFFSET = 0
@@ -541,6 +549,33 @@ def ensure_account_note_columns():
         conn.commit()
 
 
+def ensure_funpay_order_columns():
+    cursor.execute("PRAGMA table_info(accounts)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    additions = [
+        ("funpay_order_id", "TEXT"),
+        ("funpay_order_url", "TEXT"),
+        ("funpay_order_status", "TEXT"),
+        ("funpay_order_price", "TEXT"),
+        ("funpay_order_buyer", "TEXT"),
+        ("funpay_order_chat_id", "TEXT"),
+        ("funpay_order_last_sync_at", "TEXT"),
+        ("funpay_order_last_code_sent_at", "TEXT"),
+        ("rent_reminder_5m_sent_at", "TEXT"),
+        ("rent_overdue_notified_at", "TEXT"),
+    ]
+
+    changed = False
+    for column_name, column_def in additions:
+        if column_name not in columns:
+            cursor.execute(f"ALTER TABLE accounts ADD COLUMN {column_name} {column_def}")
+            changed = True
+
+    if changed:
+        conn.commit()
+
+
 def ensure_rent_history_table():
     cursor.execute(
         """
@@ -642,6 +677,7 @@ class RentAccount(StatesGroup):
     mode = State()
     select_account = State()
     select_time    = State()
+    enter_order    = State()
 
 class ExtendAccount(StatesGroup):
     select_account = State()
@@ -700,6 +736,11 @@ dp = Dispatcher()
 
 cancel_kb = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="Отмена")]],
+    resize_keyboard=True
+)
+
+skip_or_cancel_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="Пропустить")], [KeyboardButton(text="Отмена")]],
     resize_keyboard=True
 )
 
@@ -856,11 +897,35 @@ def get_account_by_id(aid: int):
                steam_presence_checked_at,
                account_note,
                weekly_drop_claimed_period,
-               weekly_drop_claimed_at
+               weekly_drop_claimed_at,
+               funpay_order_id,
+               funpay_order_url,
+               funpay_order_status,
+               funpay_order_price,
+               funpay_order_buyer,
+               funpay_order_chat_id,
+               funpay_order_last_sync_at,
+               funpay_order_last_code_sent_at,
+               rent_reminder_5m_sent_at,
+               rent_overdue_notified_at
           FROM accounts
          WHERE id = ?
         """,
         (aid,),
+    )
+    return cursor.fetchone()
+
+
+def get_account_by_funpay_order_id(order_id: str):
+    cursor.execute(
+        """
+        SELECT *
+          FROM accounts
+         WHERE funpay_order_id = ?
+           AND status = 'busy'
+         LIMIT 1
+        """,
+        (order_id,),
     )
     return cursor.fetchone()
 
@@ -982,9 +1047,9 @@ def get_current_drop_period_start(now: datetime | None = None) -> str:
 def get_weekly_drop_status(row) -> tuple[bool, str | None, str | None]:
     claimed_period = None
     claimed_at = None
-    if row and len(row) > 39:
-        claimed_period = row[38]
-        claimed_at = row[39]
+    if row and len(row) > 30:
+        claimed_period = row[29]
+        claimed_at = row[30]
 
     current_period = get_current_drop_period_start()
     return claimed_period == current_period, claimed_period, claimed_at
@@ -1074,6 +1139,108 @@ def build_weekly_drop_menu_text(row) -> str:
         "Здесь можно вручную отметить, что недельный дроп забран.",
     ])
     return "\n".join(lines)
+
+
+FUNPAY_ORDER_ID_RE = re.compile(r"/orders/([A-Za-z0-9]+)/?")
+
+
+def parse_funpay_order_ref(value: str | None) -> tuple[str | None, str | None]:
+    raw = (value or "").strip()
+    if not raw or raw.lower() in {"-", "нет", "пусто", "none", "пропустить"}:
+        return None, None
+
+    match = FUNPAY_ORDER_ID_RE.search(raw)
+    if match:
+        order_id = match.group(1).strip().upper()
+        return order_id, f"https://funpay.com/orders/{order_id}/"
+
+    cleaned = raw.strip().strip("/")
+    if cleaned:
+        order_id = cleaned.upper()
+        return order_id, f"https://funpay.com/orders/{order_id}/"
+
+    return None, None
+
+
+def normalize_funpay_order_fields(order_id: str | None, order_url: str | None) -> tuple[str | None, str | None]:
+    parsed_id, parsed_url = parse_funpay_order_ref(order_url or order_id)
+    if parsed_id and not parsed_url:
+        parsed_url = f"https://funpay.com/orders/{parsed_id}/"
+    return parsed_id, parsed_url
+
+
+def set_funpay_order_context(
+    aid: int,
+    order_id: str | None,
+    order_url: str | None,
+    buyer_username: str | None = None,
+    chat_id: int | str | None = None,
+    status: str | None = None,
+    price: str | None = None,
+) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cursor.execute(
+        """
+        UPDATE accounts
+           SET funpay_order_id = ?,
+               funpay_order_url = ?,
+               funpay_order_buyer = COALESCE(?, funpay_order_buyer),
+               funpay_order_chat_id = COALESCE(?, funpay_order_chat_id),
+               funpay_order_status = COALESCE(?, funpay_order_status),
+               funpay_order_price = COALESCE(?, funpay_order_price),
+               funpay_order_last_sync_at = ?
+         WHERE id = ?
+        """,
+        (
+            order_id,
+            order_url,
+            buyer_username,
+            str(chat_id) if chat_id is not None else None,
+            status,
+            str(price) if price is not None else None,
+            now_iso,
+            aid,
+        ),
+    )
+
+
+def clear_funpay_order_context(aid: int) -> None:
+    cursor.execute(
+        """
+        UPDATE accounts
+           SET funpay_order_id = NULL,
+               funpay_order_url = NULL,
+               funpay_order_status = NULL,
+               funpay_order_price = NULL,
+               funpay_order_buyer = NULL,
+               funpay_order_chat_id = NULL,
+               funpay_order_last_sync_at = NULL,
+               funpay_order_last_code_sent_at = NULL,
+               rent_reminder_5m_sent_at = NULL,
+               rent_overdue_notified_at = NULL
+         WHERE id = ?
+        """,
+        (aid,),
+    )
+
+
+def format_funpay_order_label(row) -> str:
+    order_id = row[40] if len(row) > 40 else None
+    order_status = row[42] if len(row) > 42 else None
+    order_price = row[43] if len(row) > 43 else None
+    buyer = row[44] if len(row) > 44 else None
+
+    if not order_id:
+        return "не привязан"
+
+    parts = [str(order_id)]
+    if order_status:
+        parts.append(str(order_status))
+    if order_price:
+        parts.append(str(order_price))
+    if buyer:
+        parts.append(f"buyer: {buyer}")
+    return " | ".join(parts)
 
 
 def get_rent_statistics_text() -> str:
@@ -1964,6 +2131,184 @@ def _funpay_build_account_sync(golden_key: str, user_agent: str | None = None):
     return acc
 
 
+def _funpay_send_chat_message_sync(chat_id: int | str, message_text: str, user_agent: str | None = None) -> None:
+    golden_key = resolve_funpay_golden_key()
+    if not golden_key:
+        raise RuntimeError("FunPay golden key не задан")
+
+    acc = _funpay_build_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
+    acc.send_message(int(chat_id), message_text)
+
+
+async def _funpay_register_new_order(
+    order_id: str | None,
+    order_url: str | None,
+    buyer_username: str | None,
+    chat_id: int | None,
+    status: str | None,
+    price: str | None,
+) -> None:
+    if not order_id:
+        return
+
+    cursor.execute(
+        """
+        SELECT id
+          FROM accounts
+         WHERE status = 'busy'
+           AND funpay_order_id = ?
+         LIMIT 1
+        """,
+        (order_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return
+
+    aid = row[0]
+    set_funpay_order_context(aid, order_id, order_url, buyer_username, chat_id, status, price)
+    conn.commit()
+
+
+async def _funpay_handle_chat_message(
+    chat_id: int | None,
+    author_id: int | None,
+    text: str | None,
+) -> None:
+    if chat_id is None or author_id is None:
+        return
+
+    normalized = (text or "").strip().lower()
+    if normalized not in {"/code", "код", "code", "steam code", "steam"}:
+        return
+
+    cursor.execute(
+        """
+        SELECT *
+          FROM accounts
+         WHERE status = 'busy'
+           AND funpay_order_chat_id = ?
+         LIMIT 1
+        """,
+        (str(chat_id),),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return
+
+    if row[0] is None:
+        return
+
+    steam_shared_secret = row[24] if len(row) > 24 else None
+    if not steam_shared_secret:
+        return
+
+    try:
+        code, _seconds_left = generate_steam_guard_code(decrypt(steam_shared_secret))
+    except Exception as e:
+        logging.error(f"funpay code generation error: {e}")
+        return
+
+    try:
+        await asyncio.to_thread(_funpay_send_chat_message_sync, chat_id, f"Steam Guard код: {code}")
+        cursor.execute(
+            "UPDATE accounts SET funpay_order_last_code_sent_at = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), row[0]),
+        )
+        conn.commit()
+    except Exception as e:
+        logging.error(f"funpay code send error: {e}")
+
+
+def _funpay_listener_thread(loop: asyncio.AbstractEventLoop) -> None:
+    global FUNPAY_LISTENER_THREAD_STARTED
+    if FunPayRunner is None:
+        logging.warning("FunPayRunner not available; FunPay listener disabled")
+        return
+
+    golden_key = resolve_funpay_golden_key()
+    if not golden_key:
+        logging.warning("FunPay golden key not set; FunPay listener disabled")
+        return
+
+    try:
+        acc = _funpay_build_account_sync(golden_key, resolve_funpay_user_agent())
+        runner = FunPayRunner(acc)
+    except Exception as e:
+        logging.error(f"FunPay listener init error: {e}")
+        return
+
+    FUNPAY_LISTENER_THREAD_STARTED = True
+    logging.info("FunPay listener started")
+
+    try:
+        for event in runner.listen(requests_delay=4):
+            try:
+                event_type = getattr(event, "type", None)
+                if event_type == getattr(FunPayEnums.EventTypes, "NEW_ORDER", None):
+                    order = getattr(event, "order", None)
+                    order_id = str(getattr(order, "id", "") or "").strip().upper() or None
+                    buyer_username = getattr(order, "buyer_username", None)
+                    order_status = getattr(order, "status", None) or getattr(order, "state", None)
+                    order_price = getattr(order, "price", None) or getattr(order, "sum", None)
+                    order_url = f"https://funpay.com/orders/{order_id}/" if order_id else None
+                    chat_id = None
+                    if buyer_username:
+                        try:
+                            chat = acc.get_chat_by_name(buyer_username, True)
+                            chat_id = int(getattr(chat, "id", None) or 0) or None
+                        except Exception as e:
+                            logging.error(f"FunPay chat resolve error: {e}")
+
+                    if loop.is_running():
+                        future = asyncio.run_coroutine_threadsafe(
+                            _funpay_register_new_order(order_id, order_url, buyer_username, chat_id, order_status, str(order_price) if order_price is not None else None),
+                            loop,
+                        )
+                        try:
+                            future.result(timeout=15)
+                        except Exception as e:
+                            logging.error(f"FunPay new order sync error: {e}")
+
+                elif event_type == getattr(FunPayEnums.EventTypes, "NEW_MESSAGE", None):
+                    message_obj = getattr(event, "message", None)
+                    chat_id = getattr(message_obj, "chat_id", None)
+                    author_id = getattr(message_obj, "author_id", None)
+                    text = getattr(message_obj, "text", None)
+                    if loop.is_running():
+                        future = asyncio.run_coroutine_threadsafe(
+                            _funpay_handle_chat_message(chat_id, author_id, text),
+                            loop,
+                        )
+                        try:
+                            future.result(timeout=15)
+                        except Exception as e:
+                            logging.error(f"FunPay chat message sync error: {e}")
+            except Exception as e:
+                logging.error(f"FunPay listener event error: {e}")
+    except Exception as e:
+        logging.error(f"FunPay listener stopped: {e}")
+
+
+def start_funpay_listener(loop: asyncio.AbstractEventLoop) -> None:
+    global FUNPAY_LISTENER_THREAD
+    if FUNPAY_LISTENER_THREAD_STARTED:
+        return
+
+    if FunPayRunner is None:
+        logging.warning("FunPay listener not started: FunPayRunner unavailable")
+        return
+
+    thread = threading.Thread(
+        target=_funpay_listener_thread,
+        args=(loop,),
+        name="funpay-listener",
+        daemon=True,
+    )
+    FUNPAY_LISTENER_THREAD = thread
+    thread.start()
+
+
 def _funpay_collect_balance_lot_candidates(acc, limit: int = 12) -> list[int]:
     candidates: list[int] = []
     seen: set[int] = set()
@@ -2395,6 +2740,18 @@ async def build_account_details_text(row) -> str:
     steam_presence_game = rest[26] if len(rest) > 26 else None
     steam_presence_checked_at = rest[27] if len(rest) > 27 else None
     account_note = rest[28] if len(rest) > 28 else None
+    weekly_drop_claimed_period = rest[29] if len(rest) > 29 else None
+    weekly_drop_claimed_at = rest[30] if len(rest) > 30 else None
+    funpay_order_id = rest[31] if len(rest) > 31 else None
+    funpay_order_url = rest[32] if len(rest) > 32 else None
+    funpay_order_status = rest[33] if len(rest) > 33 else None
+    funpay_order_price = rest[34] if len(rest) > 34 else None
+    funpay_order_buyer = rest[35] if len(rest) > 35 else None
+    funpay_order_chat_id = rest[36] if len(rest) > 36 else None
+    funpay_order_last_sync_at = rest[37] if len(rest) > 37 else None
+    funpay_order_last_code_sent_at = rest[38] if len(rest) > 38 else None
+    rent_reminder_5m_sent_at = rest[39] if len(rest) > 39 else None
+    rent_overdue_notified_at = rest[40] if len(rest) > 40 else None
 
     details_lines = [
         f"Данные аккаунта: {s_login}",
@@ -2444,6 +2801,45 @@ async def build_account_details_text(row) -> str:
         f"  {format_account_note_preview(account_note)}",
         f"Еженедельный дроп: {format_weekly_drop_label(row)}",
     ])
+    if weekly_drop_claimed_period or weekly_drop_claimed_at:
+        drop_meta = []
+        if weekly_drop_claimed_period:
+            drop_meta.append(f"период {weekly_drop_claimed_period}")
+        if weekly_drop_claimed_at:
+            dt = parse_iso_datetime(weekly_drop_claimed_at)
+            drop_meta.append(
+                f"отметка {dt.astimezone(LOCAL_TIMEZONE).strftime('%d.%m.%Y %H:%M') if dt else weekly_drop_claimed_at}"
+            )
+        details_lines.append("  " + " | ".join(drop_meta))
+
+    details_lines.extend([
+        "",
+        "FunPay заказ:",
+        f"  Номер: {funpay_order_id or '-'}",
+        f"  Ссылка: {funpay_order_url or '-'}",
+        f"  Статус: {funpay_order_status or '-'}",
+        f"  Цена: {funpay_order_price or '-'}",
+        f"  Покупатель: {funpay_order_buyer or '-'}",
+    ])
+    if funpay_order_chat_id:
+        details_lines.append(f"  Chat ID: {funpay_order_chat_id}")
+    if funpay_order_last_sync_at:
+        dt = parse_iso_datetime(funpay_order_last_sync_at)
+        if dt:
+            details_lines.append(f"  Синхронизация: {dt.astimezone(LOCAL_TIMEZONE).strftime('%d.%m.%Y %H:%M')}")
+    if funpay_order_last_code_sent_at:
+        dt = parse_iso_datetime(funpay_order_last_code_sent_at)
+        if dt:
+            details_lines.append(f"  Код отправлен: {dt.astimezone(LOCAL_TIMEZONE).strftime('%d.%m.%Y %H:%M')}")
+    if rent_reminder_5m_sent_at:
+        dt = parse_iso_datetime(rent_reminder_5m_sent_at)
+        if dt:
+            details_lines.append(f"  Напоминание 5 мин: {dt.astimezone(LOCAL_TIMEZONE).strftime('%d.%m.%Y %H:%M')}")
+    if rent_overdue_notified_at:
+        dt = parse_iso_datetime(rent_overdue_notified_at)
+        if dt:
+            details_lines.append(f"  Просрочка: {dt.astimezone(LOCAL_TIMEZONE).strftime('%d.%m.%Y %H:%M')}")
+
     if steam_presence_checked_at:
         checked_at_dt = parse_iso_datetime(steam_presence_checked_at)
         if checked_at_dt:
@@ -2485,6 +2881,7 @@ def detail_actions_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Код Steam"), KeyboardButton(text="Код Faceit")],
+            [KeyboardButton(text="Код в заказ")],
             [KeyboardButton(text="Блокировка Faceit"), KeyboardButton(text="Блокировка Steam")],
             [KeyboardButton(text="История аренд"), KeyboardButton(text="Дроп")],
             [KeyboardButton(text="Редактировать"), KeyboardButton(text="Удалить")],
@@ -2805,6 +3202,8 @@ def restore_database_from_file(backup_path: str) -> None:
     ensure_rent_history_table()
     ensure_steam_trade_columns()
     ensure_steam_presence_columns()
+    ensure_account_note_columns()
+    ensure_funpay_order_columns()
     migrate_encryption()
 
 # ────────────────────────────────────────────────
@@ -2983,7 +3382,8 @@ async def render_accounts_list(message: types.Message, state: FSMContext):
         SELECT id, steam_login, status, rent_end,
                faceit_blocked, faceit_block_ends_at,
                steam_blocked, steam_block_ends_at,
-               steam_presence_state, steam_presence_game
+               steam_presence_state, steam_presence_game,
+               funpay_order_id, funpay_order_status
           FROM accounts
          ORDER BY steam_login
         """
@@ -2995,7 +3395,7 @@ async def render_accounts_list(message: types.Message, state: FSMContext):
 
     lines = []
     rows_data = []
-    for aid, login, st, end, faceit_blocked, faceit_block_end, steam_blocked, steam_block_end, steam_presence_state, steam_presence_game in rows:
+    for aid, login, st, end, faceit_blocked, faceit_block_end, steam_blocked, steam_block_end, steam_presence_state, steam_presence_game, funpay_order_id, funpay_order_status in rows:
         rows_data.append({
             "id": aid,
             "login": login,
@@ -3007,6 +3407,8 @@ async def render_accounts_list(message: types.Message, state: FSMContext):
             "steam_block_end": steam_block_end,
             "steam_presence_state": steam_presence_state,
             "steam_presence_game": steam_presence_game,
+            "funpay_order_id": funpay_order_id,
+            "funpay_order_status": funpay_order_status,
         })
 
         has_blocks = bool(faceit_blocked) or bool(steam_blocked)
@@ -3032,6 +3434,12 @@ async def render_accounts_list(message: types.Message, state: FSMContext):
         presence_text = format_steam_presence_label(steam_presence_state, steam_presence_game)
         if presence_text != "нет данных":
             parts.append("Steam " + presence_text)
+
+        if funpay_order_id:
+            order_part = f"FunPay заказ {funpay_order_id}"
+            if funpay_order_status:
+                order_part += f" ({funpay_order_status})"
+            parts.append(order_part)
 
         lines.append(" | ".join(parts))
 
@@ -3154,6 +3562,59 @@ async def account_detail_action(message: types.Message, state: FSMContext):
             f"Код обновится через {seconds_left} сек.",
             reply_markup=copy_buffer_kb(code, "Скопировать код")
         )
+
+    if txt == "код в заказ":
+        if not row:
+            await state.clear()
+            return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
+
+        chat_id = row[45] if len(row) > 45 else None
+        buyer_username = row[44] if len(row) > 44 else None
+        golden_key = resolve_funpay_golden_key()
+        if not chat_id and buyer_username and golden_key:
+            try:
+                acc = _funpay_build_account_sync(golden_key, resolve_funpay_user_agent())
+                chat = acc.get_chat_by_name(buyer_username, True)
+                chat_id = getattr(chat, "id", None)
+            except Exception as e:
+                logging.error(f"order chat resolve error: {e}")
+
+        if not chat_id:
+            return await message.answer(
+                "Для этого аккаунта ещё не привязан чат заказа FunPay.",
+                reply_markup=detail_actions_kb()
+            )
+
+        if not steam_shared_secret:
+            return await message.answer(
+                "Для этого аккаунта не сохранён Steam shared secret.",
+                reply_markup=detail_actions_kb()
+            )
+
+        try:
+            code, _seconds_left = generate_steam_guard_code(decrypt(steam_shared_secret))
+        except Exception as e:
+            logging.error(f"steam code error for order: {e}")
+            return await message.answer(
+                "Не удалось сгенерировать Steam код.",
+                reply_markup=detail_actions_kb()
+            )
+
+        try:
+            await asyncio.to_thread(_funpay_send_chat_message_sync, chat_id, f"Steam Guard код: {code}")
+            cursor.execute(
+                "UPDATE accounts SET funpay_order_last_code_sent_at = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(), aid),
+            )
+            conn.commit()
+        except Exception as e:
+            logging.error(f"order code send error: {e}")
+            return await message.answer(
+                "Не удалось отправить код в чат заказа.",
+                reply_markup=detail_actions_kb()
+            )
+
+        return await message.answer("Код отправлен в чат заказа FunPay.", reply_markup=detail_actions_kb())
 
     if txt in {"блокировка faceit", "блокировка steam"}:
         if not row:
@@ -4146,6 +4607,7 @@ def funpay_status_text() -> str:
         f"FunPayAPI: {'установлена' if FunPayAccount else 'не установлена'}\n"
         f"FunPay Golden Key: {'установлен' if golden_key else 'не установлен'}\n"
         f"FunPay User-Agent: {'установлен' if user_agent else 'не установлен'}\n"
+        f"FunPay слушатель чата: {'активен' if FUNPAY_LISTENER_THREAD_STARTED else 'не активен'}\n"
         f"Автоподъём лотов: {auto_raise}\n"
         f"Следующий автоподъём: {next_raise}"
     )
@@ -4300,65 +4762,128 @@ async def rent_confirm_time(message: types.Message, state: FSMContext):
     start_at = datetime.now()
     end = start_at + delta
 
+    await state.update_data(
+        selected_id=aid,
+        selected_login=login,
+        rent_package=rent_package,
+        rent_started_at=start_at.isoformat(),
+        rent_end=end.isoformat(),
+    )
+    await state.set_state(RentAccount.enter_order)
+    return await message.answer(
+        "Введите номер заказа FunPay или ссылку вида https://funpay.com/orders/YAT27MC9/\n"
+        "Если заказа нет, нажмите «Пропустить».",
+        reply_markup=skip_or_cancel_kb
+    )
+
+
+@dp.message(StateFilter(RentAccount.enter_order))
+async def rent_enter_order(message: types.Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    if txt.lower() == "отмена":
+        await state.clear()
+        return await message.answer("Сдача отменена.", reply_markup=main_menu)
+    if txt.lower() == "пропустить":
+        txt = "-"
+
+    data = await state.get_data()
+    aid = data.get("selected_id")
+    login = data.get("selected_login")
+    rent_package = data.get("rent_package", "steam")
+    start_at_raw = data.get("rent_started_at")
+    end_raw = data.get("rent_end")
+
+    if not aid or not login or not start_at_raw or not end_raw:
+        await state.clear()
+        return await message.answer("Не удалось восстановить данные сдачи.", reply_markup=main_menu)
+
+    try:
+        start_at = datetime.fromisoformat(start_at_raw)
+        end = datetime.fromisoformat(end_raw)
+    except Exception:
+        await state.clear()
+        return await message.answer("Некорректные даты сдачи.", reply_markup=main_menu)
+
+    order_id, order_url = parse_funpay_order_ref(txt)
+    if txt and txt.lower() not in {"-", "нет", "пусто", "none", "пропустить"} and not order_id:
+        return await message.answer(
+            "Не удалось распознать номер заказа. Отправьте ссылку формата https://funpay.com/orders/YAT27MC9/ или сам номер заказа.",
+            reply_markup=cancel_kb
+        )
+
     try:
         cursor.execute(
-            "UPDATE accounts SET status='busy', rent_end=? WHERE id=? AND status='free'",
+            "UPDATE accounts SET status='busy', rent_end=?, rent_reminder_5m_sent_at=NULL, rent_overdue_notified_at=NULL WHERE id=? AND status='free'",
             (end.isoformat(), aid)
         )
         if cursor.rowcount == 0:
             conn.rollback()
-            await message.answer("Аккаунт уже занят или удалён", reply_markup=main_menu)
-        else:
-            add_rent_history_entry(aid, login, rent_package, start_at, end)
-            conn.commit()
-            await message.answer(
-                f"Аккаунт **{login}** сдан до {end.strftime('%d.%m %H:%M')}",
-                reply_markup=main_menu
-            )
+            await state.clear()
+            return await message.answer("Аккаунт уже занят или удалён", reply_markup=main_menu)
 
-            cursor.execute(
-                """
-                SELECT steam_login, steam_password, faceit_url, faceit_email, faceit_password, COALESCE(faceit_blocked, 0)
-                  FROM accounts
-                 WHERE id = ?
-                """,
-                (aid,)
-            )
-            row = cursor.fetchone()
-            if row:
-                s_login, s_pw_enc, f_url, f_email, f_pw_enc, faceit_blocked = row
-                s_pw = decrypt(s_pw_enc)
-                buyer_text_lines = [
-                    "Данные для покупателя:",
-                    f"Steam логин: {s_login}",
-                    f"Steam пароль: {s_pw}",
-                ]
-                buyer_copy_lines = [
-                    f"Steam логин: {s_login}",
-                    f"Steam пароль: {s_pw}",
-                ]
-                should_send_faceit = rent_package == "steam_faceit" and not bool(faceit_blocked)
-                if should_send_faceit and (f_url or f_email or f_pw_enc):
-                    faceit_email = f_email or "-"
-                    faceit_password = decrypt(f_pw_enc) if f_pw_enc else "-"
-                    buyer_text_lines.extend([
-                        "",
-                        f"Faceit email: {faceit_email}",
-                        f"Faceit пароль: {faceit_password}",
-                    ])
-                    buyer_copy_lines.extend([
-                        f"Faceit email: {faceit_email}",
-                        f"Faceit пароль: {faceit_password}",
-                    ])
+        clear_funpay_order_context(aid)
+        if order_id:
+            set_funpay_order_context(aid, order_id, order_url)
 
-                await message.answer(
-                    "\n".join(buyer_text_lines),
-                    reply_markup=copy_buffer_kb("\n".join(buyer_copy_lines), "Скопировать в буфер")
-                )
+        add_rent_history_entry(aid, login, rent_package, start_at, end)
+        conn.commit()
     except Exception as e:
         conn.rollback()
         logging.error(f"rent error: {e}")
-        await message.answer("Ошибка при сдаче", reply_markup=main_menu)
+        await state.clear()
+        return await message.answer("Ошибка при сдаче", reply_markup=main_menu)
+
+    await message.answer(
+        f"Аккаунт **{login}** сдан до {end.strftime('%d.%m %H:%M')}",
+        reply_markup=main_menu
+    )
+
+    cursor.execute(
+        """
+        SELECT steam_login, steam_password, faceit_url, faceit_email, faceit_password, COALESCE(faceit_blocked, 0)
+          FROM accounts
+         WHERE id = ?
+        """,
+        (aid,)
+    )
+    row = cursor.fetchone()
+    if row:
+        s_login, s_pw_enc, f_url, f_email, f_pw_enc, faceit_blocked = row
+        s_pw = decrypt(s_pw_enc)
+        buyer_text_lines = [
+            "Данные для покупателя:",
+            f"Steam логин: {s_login}",
+            f"Steam пароль: {s_pw}",
+        ]
+        buyer_copy_lines = [
+            f"Steam логин: {s_login}",
+            f"Steam пароль: {s_pw}",
+        ]
+        should_send_faceit = rent_package == "steam_faceit" and not bool(faceit_blocked)
+        if should_send_faceit and (f_url or f_email or f_pw_enc):
+            faceit_email = f_email or "-"
+            faceit_password = decrypt(f_pw_enc) if f_pw_enc else "-"
+            buyer_text_lines.extend([
+                "",
+                f"Faceit email: {faceit_email}",
+                f"Faceit пароль: {faceit_password}",
+            ])
+            buyer_copy_lines.extend([
+                f"Faceit email: {faceit_email}",
+                f"Faceit пароль: {faceit_password}",
+            ])
+
+        if order_id:
+            buyer_text_lines.extend([
+                "",
+                f"FunPay заказ: {order_id}",
+                f"Ссылка: {order_url or 'неизвестно'}",
+            ])
+
+        await message.answer(
+            "\n".join(buyer_text_lines),
+            reply_markup=copy_buffer_kb("\n".join(buyer_copy_lines), "Скопировать в буфер")
+        )
 
     await state.clear()
 
@@ -4396,6 +4921,7 @@ async def free_select(message: types.Message, state: FSMContext):
     try:
         cursor.execute("UPDATE accounts SET status='free', rent_end=NULL WHERE id=?", (aid,))
         close_open_rent_history(aid, datetime.now(), "manual_free")
+        clear_funpay_order_context(aid)
         conn.commit()
         await message.answer(f"Аккаунт {login} освобождён", reply_markup=main_menu)
     except Exception as e:
@@ -4476,7 +5002,13 @@ async def extend_confirm(message: types.Message, state: FSMContext):
 
     try:
         cursor.execute(
-            "UPDATE accounts SET rent_end = ? WHERE id = ? AND status = 'busy'",
+            """
+            UPDATE accounts
+               SET rent_end = ?,
+                   rent_reminder_5m_sent_at = NULL,
+                   rent_overdue_notified_at = NULL
+             WHERE id = ? AND status = 'busy'
+            """,
             (new_end.isoformat(), aid)
         )
         if cursor.rowcount == 0:
@@ -4512,20 +5044,86 @@ async def checker_loop():
             clean_invalid_dates()
             clean_expired_faceit_blocks()
             clean_expired_steam_blocks()
-            cursor.execute("SELECT id, steam_login, rent_end FROM accounts WHERE status='busy'")
+            cursor.execute(
+                """
+                SELECT id,
+                       steam_login,
+                       rent_end,
+                       COALESCE(rent_reminder_5m_sent_at, ''),
+                       COALESCE(rent_overdue_notified_at, ''),
+                       funpay_order_chat_id,
+                       funpay_order_buyer,
+                       steam_presence_state,
+                       steam_presence_game
+                  FROM accounts
+                 WHERE status='busy'
+                """
+            )
             for row in cursor.fetchall():
                 try:
                     end = datetime.fromisoformat(row[2])
                     left = (end - datetime.now()).total_seconds()
-                    if 240 < left < 300:
+                    reminder_sent_at = row[3] if len(row) > 3 else ""
+                    overdue_sent_at = row[4] if len(row) > 4 else ""
+                    funpay_chat_id = row[5] if len(row) > 5 else None
+                    funpay_buyer = row[6] if len(row) > 6 else None
+                    steam_presence_state = row[7] if len(row) > 7 else None
+                    steam_presence_game = row[8] if len(row) > 8 else None
+
+                    if 240 < left < 300 and not reminder_sent_at:
+                        reminder_text = f"⚠️ {row[1]} — ~5 минут до конца аренды"
                         for admin_id in ADMIN_IDS:
-                            await bot.send_message(admin_id, f"⚠️ {row[1]} — ~5 минут до конца")
-                    if left <= 0:
-                        cursor.execute("UPDATE accounts SET status='free', rent_end=NULL WHERE id=?", (row[0],))
-                        close_open_rent_history(row[0], datetime.now(), "auto_free")
+                            await bot.send_message(admin_id, reminder_text)
+                        cursor.execute(
+                            "UPDATE accounts SET rent_reminder_5m_sent_at = ? WHERE id = ?",
+                            (datetime.now(timezone.utc).isoformat(), row[0]),
+                        )
                         conn.commit()
-                        for admin_id in ADMIN_IDS:
-                            await bot.send_message(admin_id, f"✅ {row[1]} освобождён автоматически")
+                        if funpay_chat_id:
+                            try:
+                                await asyncio.to_thread(
+                                    _funpay_send_chat_message_sync,
+                                    funpay_chat_id,
+                                    "⚠️ До конца аренды осталось около 5 минут. Если нужен код, отправьте /code."
+                                )
+                            except Exception as e:
+                                logging.error(f"funpay reminder send error: {e}")
+
+                    if left <= 0:
+                        presence_label = format_steam_presence_label(steam_presence_state, steam_presence_game)
+                        is_in_game = presence_label.startswith("в игре")
+
+                        if is_in_game:
+                            if not overdue_sent_at:
+                                warning_text = (
+                                    f"⚠️ Время аренды для {row[1]} закончилось, "
+                                    f"но аккаунт всё ещё в игре ({presence_label}). "
+                                    "Пожалуйста, продлите аренду или завершите сессию."
+                                )
+                                for admin_id in ADMIN_IDS:
+                                    await bot.send_message(admin_id, warning_text)
+                                cursor.execute(
+                                    "UPDATE accounts SET rent_overdue_notified_at = ? WHERE id = ?",
+                                    (datetime.now(timezone.utc).isoformat(), row[0]),
+                                )
+                                conn.commit()
+                                if funpay_chat_id:
+                                    try:
+                                        await asyncio.to_thread(
+                                            _funpay_send_chat_message_sync,
+                                            funpay_chat_id,
+                                            "⚠️ Время аренды закончилось, но аккаунт всё ещё в игре. "
+                                            "Пожалуйста, продлите аренду или завершите сессию."
+                                        )
+                                    except Exception as e:
+                                        logging.error(f"funpay overdue send error: {e}")
+                        else:
+                            cursor.execute("UPDATE accounts SET status='free', rent_end=NULL WHERE id=?", (row[0],))
+                            close_open_rent_history(row[0], datetime.now(), "auto_free")
+                            clear_funpay_order_context(row[0])
+                            conn.commit()
+                            for admin_id in ADMIN_IDS:
+                                await bot.send_message(admin_id, f"✅ {row[1]} освобождён автоматически")
                 except:
                     pass
 
@@ -4600,7 +5198,7 @@ async def checker_loop():
 # ────────────────────────────────────────────────
 
 async def main():
-    global FACEIT_API_KEY
+    global FACEIT_API_KEY, MAIN_LOOP
     ensure_faceit_url_column()
     ensure_rent_history_table()
     ensure_faceit_block_columns()
@@ -4610,10 +5208,13 @@ async def main():
     ensure_steam_trade_columns()
     ensure_steam_presence_columns()
     ensure_account_note_columns()
+    ensure_funpay_order_columns()
     migrate_encryption()
     FACEIT_API_KEY = resolve_faceit_api_key()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     log_runtime_config()
+    MAIN_LOOP = asyncio.get_running_loop()
+    start_funpay_listener(MAIN_LOOP)
     asyncio.create_task(checker_loop())
     print("Бот запущен")
     await dp.start_polling(bot, allowed_updates=["message"])
