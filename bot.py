@@ -1176,6 +1176,41 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
 
     acc = _funpay_build_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
 
+    direct_lookup_errors: list[str] = []
+    direct_lookup_methods = ("get_order", "getOrder")
+    normalized_id = str(order_id).strip().upper()
+    for method_name in direct_lookup_methods:
+        method = getattr(acc, method_name, None)
+        if method is None:
+            continue
+        try:
+            direct_order = method(normalized_id)
+            if direct_order:
+                description = getattr(direct_order, "description", None) or getattr(direct_order, "title", None) or ""
+                buyer_username = getattr(direct_order, "buyer_username", None) or getattr(direct_order, "buyer", None)
+                chat_id = getattr(direct_order, "chat_id", None) or getattr(direct_order, "dialog_id", None)
+                if chat_id is None:
+                    chat_obj = getattr(direct_order, "chat", None) or getattr(direct_order, "dialog", None)
+                    chat_id = getattr(chat_obj, "id", None) if chat_obj is not None else None
+                order_status = getattr(direct_order, "status", None) or getattr(direct_order, "state", None)
+                order_price = getattr(direct_order, "price", None) or getattr(direct_order, "sum", None)
+                return {
+                    "id": normalized_id,
+                    "description": description,
+                    "buyer_username": buyer_username,
+                    "chat_id": chat_id,
+                    "status": order_status,
+                    "price": order_price,
+                    "is_faceit": "faceit" in str(description).lower(),
+                    "debug": {
+                        "matched": True,
+                        "source": f"direct_lookup:{method_name}",
+                    },
+                }
+        except Exception as e:
+            logging.error(f"FunPay direct order lookup error ({method_name}): {e}")
+            direct_lookup_errors.append(f"{method_name}:{e}")
+
     candidates: list[object] = []
     lookup_sources: list[str] = []
     lookup_errors: list[str] = []
@@ -1191,7 +1226,6 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
             logging.error(f"FunPay order lookup error ({getter_name}): {e}")
             lookup_errors.append(f"{getter_name}:{e}")
 
-    normalized_id = str(order_id).strip().upper()
     for order in candidates:
         current_id = str(getattr(order, "id", "") or "").strip().upper()
         if current_id != normalized_id:
@@ -1264,6 +1298,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
         "is_faceit": False,
         "debug": {
             "matched": False,
+            "direct_lookup_errors": direct_lookup_errors,
             "lookup_sources": lookup_sources,
             "lookup_errors": lookup_errors,
             "candidate_count": len(candidates),
@@ -1301,6 +1336,8 @@ def _funpay_format_order_debug_text(
     if isinstance(debug, dict):
         if "matched" in debug:
             lines.append(f"order_matched={debug.get('matched')}")
+        if debug.get("direct_lookup_errors"):
+            lines.append(f"direct_lookup_errors={'; '.join(map(str, debug.get('direct_lookup_errors')))}")
         if debug.get("lookup_sources"):
             lines.append(f"lookup_sources={', '.join(map(str, debug.get('lookup_sources')))}")
         if debug.get("lookup_errors"):
