@@ -1178,6 +1178,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
 
     candidates: list[object] = []
     lookup_sources: list[str] = []
+    lookup_errors: list[str] = []
     for getter_name in ("getNewOrders", "getLastOrders"):
         getter = getattr(acc, getter_name, None)
         if getter is None:
@@ -1188,6 +1189,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
             lookup_sources.append(f"{getter_name}:{len(items)}")
         except Exception as e:
             logging.error(f"FunPay order lookup error ({getter_name}): {e}")
+            lookup_errors.append(f"{getter_name}:{e}")
 
     normalized_id = str(order_id).strip().upper()
     for order in candidates:
@@ -1217,6 +1219,41 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
             },
         }
 
+    dialog_candidates: list[object] = []
+    try:
+        dialogs = getattr(acc, "getDialogs", None)
+        if dialogs is not None:
+            items = dialogs() or []
+            dialog_candidates.extend(items)
+            lookup_sources.append(f"getDialogs:{len(items)}")
+    except Exception as e:
+        logging.error(f"FunPay dialog lookup error: {e}")
+        lookup_errors.append(f"getDialogs:{e}")
+
+    for dialog in dialog_candidates:
+        dialog_text = str(dialog)
+        if normalized_id not in dialog_text.upper():
+            continue
+
+        dialog_id = getattr(dialog, "id", None) or getattr(dialog, "chat_id", None) or getattr(dialog, "dialog_id", None)
+        dialog_user = getattr(dialog, "username", None) or getattr(dialog, "buyer_username", None) or getattr(dialog, "user", None)
+        if dialog_user is None:
+            dialog_user_obj = getattr(dialog, "user", None)
+            dialog_user = getattr(dialog_user_obj, "name", None) or getattr(dialog_user_obj, "username", None)
+        return {
+            "id": normalized_id,
+            "description": dialog_text,
+            "buyer_username": dialog_user,
+            "chat_id": dialog_id,
+            "status": getattr(dialog, "status", None),
+            "price": getattr(dialog, "price", None),
+            "is_faceit": "faceit" in dialog_text.lower(),
+            "debug": {
+                "matched": True,
+                "source": "dialogs_lookup",
+            },
+        }
+
     return {
         "id": normalized_id,
         "description": "",
@@ -1228,7 +1265,9 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
         "debug": {
             "matched": False,
             "lookup_sources": lookup_sources,
+            "lookup_errors": lookup_errors,
             "candidate_count": len(candidates),
+            "dialog_candidate_count": len(dialog_candidates),
         },
     }
 
@@ -1264,8 +1303,12 @@ def _funpay_format_order_debug_text(
             lines.append(f"order_matched={debug.get('matched')}")
         if debug.get("lookup_sources"):
             lines.append(f"lookup_sources={', '.join(map(str, debug.get('lookup_sources')))}")
+        if debug.get("lookup_errors"):
+            lines.append(f"lookup_errors={'; '.join(map(str, debug.get('lookup_errors')))}")
         if debug.get("candidate_count") is not None:
             lines.append(f"candidate_count={debug.get('candidate_count')}")
+        if debug.get("dialog_candidate_count") is not None:
+            lines.append(f"dialog_candidate_count={debug.get('dialog_candidate_count')}")
         if debug.get("source"):
             lines.append(f"source={debug.get('source')}")
     return "FunPay debug:\n" + "\n".join(lines)
