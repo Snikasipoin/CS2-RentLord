@@ -1177,6 +1177,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
     acc = _funpay_build_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
 
     candidates: list[object] = []
+    lookup_sources: list[str] = []
     for getter_name in ("getNewOrders", "getLastOrders"):
         getter = getattr(acc, getter_name, None)
         if getter is None:
@@ -1184,6 +1185,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
         try:
             items = getter() or []
             candidates.extend(items)
+            lookup_sources.append(f"{getter_name}:{len(items)}")
         except Exception as e:
             logging.error(f"FunPay order lookup error ({getter_name}): {e}")
 
@@ -1209,9 +1211,64 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
             "status": order_status,
             "price": order_price,
             "is_faceit": "faceit" in str(description).lower(),
+            "debug": {
+                "matched": True,
+                "source": "orders_lookup",
+            },
         }
 
-    return {"id": normalized_id, "description": "", "buyer_username": None, "chat_id": None, "status": None, "price": None, "is_faceit": False}
+    return {
+        "id": normalized_id,
+        "description": "",
+        "buyer_username": None,
+        "chat_id": None,
+        "status": None,
+        "price": None,
+        "is_faceit": False,
+        "debug": {
+            "matched": False,
+            "lookup_sources": lookup_sources,
+            "candidate_count": len(candidates),
+        },
+    }
+
+
+def _funpay_format_order_debug_text(
+    stage: str,
+    order: dict,
+    *,
+    fallback_chat_id: int | str | None = None,
+    fallback_buyer_username: str | None = None,
+    include_faceit: bool | None = None,
+    extra_error: str | None = None,
+) -> str:
+    debug = order.get("debug") or {}
+    lines = [
+        f"stage={stage}",
+        f"order_id={order.get('id') or '-'}",
+        f"buyer_username={order.get('buyer_username') or fallback_buyer_username or '-'}",
+        f"chat_id={order.get('chat_id') or fallback_chat_id or '-'}",
+        f"description={order.get('description') or '-'}",
+        f"status={order.get('status') or '-'}",
+        f"price={order.get('price') or '-'}",
+        f"is_faceit={order.get('is_faceit')}",
+        f"fallback_chat_used={bool(fallback_chat_id)}",
+        f"fallback_buyer_used={bool(fallback_buyer_username)}",
+    ]
+    if include_faceit is not None:
+        lines.append(f"include_faceit={include_faceit}")
+    if extra_error:
+        lines.append(f"error={extra_error}")
+    if isinstance(debug, dict):
+        if "matched" in debug:
+            lines.append(f"order_matched={debug.get('matched')}")
+        if debug.get("lookup_sources"):
+            lines.append(f"lookup_sources={', '.join(map(str, debug.get('lookup_sources')))}")
+        if debug.get("candidate_count") is not None:
+            lines.append(f"candidate_count={debug.get('candidate_count')}")
+        if debug.get("source"):
+            lines.append(f"source={debug.get('source')}")
+    return "FunPay debug:\n" + "\n".join(lines)
 
 
 def _funpay_send_initial_order_message_sync(
@@ -1241,11 +1298,30 @@ def _funpay_send_initial_order_message_sync(
         try:
             chat = acc.get_chat_by_name(buyer_username, True)
         except Exception as e:
-            return {"error": f"Не удалось получить чат заказа: {e}"}
+            return {
+                "error": "Не удалось получить чат заказа\n"
+                + _funpay_format_order_debug_text(
+                    "resolve_chat_by_name",
+                    order,
+                    fallback_chat_id=fallback_chat_id,
+                    fallback_buyer_username=fallback_buyer_username,
+                    include_faceit=bool(order.get("is_faceit") and include_faceit),
+                    extra_error=str(e),
+                )
+            }
 
         chat_id = getattr(chat, "id", None)
     if not chat_id:
-        return {"error": "Не удалось определить чат заказа"}
+        return {
+            "error": "Не удалось определить чат заказа\n"
+            + _funpay_format_order_debug_text(
+                "initial_order_message",
+                order,
+                fallback_chat_id=fallback_chat_id,
+                fallback_buyer_username=fallback_buyer_username,
+                include_faceit=bool(order.get("is_faceit") and include_faceit),
+            )
+        }
 
     is_faceit_order = bool(order.get("is_faceit"))
     order_text_lines = [
@@ -1325,11 +1401,30 @@ def _funpay_send_code_to_order_sync(
         try:
             chat = acc.get_chat_by_name(buyer_username, True)
         except Exception as e:
-            return {"error": f"Не удалось получить чат заказа: {e}"}
+            return {
+                "error": "Не удалось получить чат заказа\n"
+                + _funpay_format_order_debug_text(
+                    "resolve_chat_by_name",
+                    order,
+                    fallback_chat_id=fallback_chat_id,
+                    fallback_buyer_username=fallback_buyer_username,
+                    include_faceit=bool(order.get("is_faceit")),
+                    extra_error=str(e),
+                )
+            }
 
         chat_id = getattr(chat, "id", None)
     if not chat_id:
-        return {"error": "Не удалось определить чат заказа"}
+        return {
+            "error": "Не удалось определить чат заказа\n"
+            + _funpay_format_order_debug_text(
+                "send_order_code",
+                order,
+                fallback_chat_id=fallback_chat_id,
+                fallback_buyer_username=fallback_buyer_username,
+                extra_error=f"code_type={code_type}",
+            )
+        }
 
     if code_type == "steam":
         if not steam_shared_secret:
