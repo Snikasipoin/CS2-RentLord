@@ -1731,6 +1731,26 @@ def normalize_db_text(value) -> str | None:
     return value_text or None
 
 
+def is_funpay_order_closed(status) -> bool:
+    text = normalize_db_text(status)
+    if not text:
+        return False
+    normalized = text.lower()
+    closed_tokens = (
+        "closed",
+        "complete",
+        "completed",
+        "finished",
+        "done",
+        "resolved",
+        "закрыт",
+        "закрыто",
+        "заверш",
+        "выполнен",
+    )
+    return any(token in normalized for token in closed_tokens)
+
+
 def get_rent_statistics_text() -> str:
     cursor.execute(
         """
@@ -5649,6 +5669,7 @@ async def checker_loop():
                        COALESCE(rent_overdue_notified_at, ''),
                        funpay_order_chat_id,
                        funpay_order_buyer,
+                       funpay_order_status,
                        steam_presence_state,
                        steam_presence_game
                   FROM accounts
@@ -5663,11 +5684,12 @@ async def checker_loop():
                     overdue_sent_at = row[4] if len(row) > 4 else ""
                     funpay_chat_id = row[5] if len(row) > 5 else None
                     funpay_buyer = row[6] if len(row) > 6 else None
-                    steam_presence_state = row[7] if len(row) > 7 else None
-                    steam_presence_game = row[8] if len(row) > 8 else None
+                    funpay_order_status = row[7] if len(row) > 7 else None
+                    steam_presence_state = row[8] if len(row) > 8 else None
+                    steam_presence_game = row[9] if len(row) > 9 else None
 
                     if 240 < left < 300 and not reminder_sent_at:
-                        reminder_text = f"⚠️ {row[1]} — ~5 минут до конца аренды"
+                        reminder_text = f"⚠️ {row[1]} — до конца аренды осталось около 5 минут. Пожалуйста, продлите аренду, если планируете продолжать."
                         for admin_id in ADMIN_IDS:
                             await bot.send_message(admin_id, reminder_text)
                         cursor.execute(
@@ -5680,7 +5702,7 @@ async def checker_loop():
                                 await asyncio.to_thread(
                                     _funpay_send_chat_message_sync,
                                     funpay_chat_id,
-                                    "⚠️ До конца аренды осталось около 5 минут. Если нужен код, отправьте /code."
+                                    "⚠️ До конца аренды осталось около 5 минут. Если планируете продолжать, пожалуйста, продлите аренду."
                                 )
                             except Exception as e:
                                 logging.error(f"funpay reminder send error: {e}")
@@ -5688,6 +5710,26 @@ async def checker_loop():
                     if left <= 0:
                         presence_label = format_steam_presence_label(steam_presence_state, steam_presence_game)
                         is_in_game = presence_label.startswith("в игре")
+                        order_closed = is_funpay_order_closed(funpay_order_status)
+
+                        if not overdue_sent_at:
+                            final_order_text = (
+                                "✅ Время аренды закончилось. Спасибо за обращение! "
+                                "Будем рады видеть вас снова."
+                                if order_closed
+                                else "⚠️ Время аренды закончилось. Пожалуйста, закройте заказ и оставьте отзыв. "
+                                     "Спасибо за сотрудничество!"
+                            )
+
+                            if funpay_chat_id:
+                                try:
+                                    await asyncio.to_thread(
+                                        _funpay_send_chat_message_sync,
+                                        funpay_chat_id,
+                                        final_order_text,
+                                    )
+                                except Exception as e:
+                                    logging.error(f"funpay overdue send error: {e}")
 
                         if is_in_game:
                             if not overdue_sent_at:
@@ -5703,17 +5745,13 @@ async def checker_loop():
                                     (datetime.now(timezone.utc).isoformat(), row[0]),
                                 )
                                 conn.commit()
-                                if funpay_chat_id:
-                                    try:
-                                        await asyncio.to_thread(
-                                            _funpay_send_chat_message_sync,
-                                            funpay_chat_id,
-                                            "⚠️ Время аренды закончилось, но аккаунт всё ещё в игре. "
-                                            "Пожалуйста, продлите аренду или завершите сессию."
-                                        )
-                                    except Exception as e:
-                                        logging.error(f"funpay overdue send error: {e}")
                         else:
+                            if not overdue_sent_at:
+                                cursor.execute(
+                                    "UPDATE accounts SET rent_overdue_notified_at = ? WHERE id = ?",
+                                    (datetime.now(timezone.utc).isoformat(), row[0]),
+                                )
+                                conn.commit()
                             cursor.execute("UPDATE accounts SET status='free', rent_end=NULL WHERE id=?", (row[0],))
                             close_open_rent_history(row[0], datetime.now(), "auto_free")
                             clear_funpay_order_context(row[0])
