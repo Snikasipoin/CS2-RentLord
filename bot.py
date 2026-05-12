@@ -1169,6 +1169,180 @@ def normalize_funpay_order_fields(order_id: str | None, order_url: str | None) -
     return parsed_id, parsed_url
 
 
+def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None) -> dict:
+    golden_key = resolve_funpay_golden_key()
+    if not golden_key:
+        return {"error": "FunPay golden key не задан"}
+
+    acc = _funpay_build_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
+
+    candidates: list[object] = []
+    for getter_name in ("getNewOrders", "getLastOrders"):
+        getter = getattr(acc, getter_name, None)
+        if getter is None:
+            continue
+        try:
+            items = getter() or []
+            candidates.extend(items)
+        except Exception as e:
+            logging.error(f"FunPay order lookup error ({getter_name}): {e}")
+
+    normalized_id = str(order_id).strip().upper()
+    for order in candidates:
+        current_id = str(getattr(order, "id", "") or "").strip().upper()
+        if current_id != normalized_id:
+            continue
+
+        description = getattr(order, "description", None) or getattr(order, "title", None) or ""
+        buyer_username = getattr(order, "buyer_username", None) or getattr(order, "buyer", None)
+        order_status = getattr(order, "status", None) or getattr(order, "state", None)
+        order_price = getattr(order, "price", None) or getattr(order, "sum", None)
+        return {
+            "id": current_id,
+            "description": description,
+            "buyer_username": buyer_username,
+            "status": order_status,
+            "price": order_price,
+            "is_faceit": "faceit" in str(description).lower(),
+        }
+
+    return {"id": normalized_id, "description": "", "buyer_username": None, "status": None, "price": None, "is_faceit": False}
+
+
+def _funpay_send_initial_order_message_sync(
+    order_id: str,
+    steam_login: str,
+    steam_password: str,
+    faceit_email: str | None = None,
+    faceit_password: str | None = None,
+    include_faceit: bool = True,
+    user_agent: str | None = None,
+) -> dict:
+    golden_key = resolve_funpay_golden_key()
+    if not golden_key:
+        return {"error": "FunPay golden key не задан"}
+
+    acc = _funpay_build_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
+    order = _funpay_find_order_record_sync(order_id, user_agent)
+    if order.get("error"):
+        return order
+
+    buyer_username = order.get("buyer_username")
+    chat = None
+    if buyer_username:
+        try:
+            chat = acc.get_chat_by_name(buyer_username, True)
+        except Exception as e:
+            return {"error": f"Не удалось получить чат заказа: {e}"}
+
+    chat_id = getattr(chat, "id", None)
+    if not chat_id:
+        return {"error": "Не удалось определить чат заказа"}
+
+    is_faceit_order = bool(order.get("is_faceit"))
+    order_text_lines = [
+        "Данные для покупателя:",
+        f"Steam логин: {steam_login}",
+        f"Steam пароль: {steam_password}",
+    ]
+    order_copy_lines = [
+        f"Steam логин: {steam_login}",
+        f"Steam пароль: {steam_password}",
+    ]
+
+    if is_faceit_order and include_faceit:
+        faceit_email_display = faceit_email or "-"
+        faceit_password_display = faceit_password or "-"
+        order_text_lines.extend([
+            "",
+            f"Faceit email: {faceit_email_display}",
+            f"Faceit пароль: {faceit_password_display}",
+        ])
+        order_copy_lines.extend([
+            f"Faceit email: {faceit_email_display}",
+            f"Faceit пароль: {faceit_password_display}",
+        ])
+
+    order_text_lines.extend([
+        "",
+        "Команды для запроса кодов:",
+        "/steam - запросить Steam Guard код",
+    ])
+    if is_faceit_order and include_faceit:
+        order_text_lines.append("/faceit - запросить Faceit код")
+        order_text_lines.append("Коды отправляются отдельно, при необходимости запросите второй код чуть позже.")
+
+    try:
+        acc.send_message(chat_id, "\n".join(order_text_lines))
+    except Exception as e:
+        return {"error": f"Не удалось отправить данные в чат заказа: {e}"}
+
+    return {
+        "success": True,
+        "chat_id": chat_id,
+        "buyer_username": buyer_username,
+        "order_id": order.get("id"),
+        "order_status": order.get("status"),
+        "order_price": order.get("price"),
+        "is_faceit_order": is_faceit_order,
+        "copy_text": "\n".join(order_copy_lines),
+    }
+
+
+def _funpay_send_code_to_order_sync(
+    order_id: str,
+    code_type: str,
+    steam_shared_secret: str | None = None,
+    faceit_2fa_secret: str | None = None,
+    user_agent: str | None = None,
+) -> dict:
+    golden_key = resolve_funpay_golden_key()
+    if not golden_key:
+        return {"error": "FunPay golden key не задан"}
+
+    acc = _funpay_build_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
+    order = _funpay_find_order_record_sync(order_id, user_agent)
+    if order.get("error"):
+        return order
+
+    if code_type == "faceit" and not order.get("is_faceit"):
+        return {"error": "Этот заказ не FACEIT, код Faceit не требуется."}
+
+    buyer_username = order.get("buyer_username")
+    chat = None
+    if buyer_username:
+        try:
+            chat = acc.get_chat_by_name(buyer_username, True)
+        except Exception as e:
+            return {"error": f"Не удалось получить чат заказа: {e}"}
+
+    chat_id = getattr(chat, "id", None)
+    if not chat_id:
+        return {"error": "Не удалось определить чат заказа"}
+
+    if code_type == "steam":
+        if not steam_shared_secret:
+            return {"error": "Steam shared secret не задан"}
+        code, _seconds_left = generate_steam_guard_code(decrypt(steam_shared_secret))
+        message_text = f"Steam Guard код: {code}"
+    elif code_type == "faceit":
+        if not faceit_2fa_secret:
+            return {"error": "Faceit 2FA secret не задан"}
+        code, _seconds_left = generate_totp_code(decrypt(faceit_2fa_secret))
+        message_text = f"Faceit код: {code}"
+    else:
+        return {"error": "Неизвестный тип кода"}
+
+    acc.send_message(chat_id, message_text)
+    return {
+        "success": True,
+        "chat_id": chat_id,
+        "buyer_username": buyer_username,
+        "code_type": code_type,
+        "code": code,
+    }
+
+
 def set_funpay_order_context(
     aid: int,
     order_id: str | None,
@@ -2179,7 +2353,7 @@ async def _funpay_handle_chat_message(
         return
 
     normalized = (text or "").strip().lower()
-    if normalized not in {"/code", "код", "code", "steam code", "steam"}:
+    if normalized not in {"/code", "/steam", "/faceit", "код", "code", "steam code", "steam", "faceit code", "faceit"}:
         return
 
     cursor.execute(
@@ -2199,18 +2373,36 @@ async def _funpay_handle_chat_message(
     if row[0] is None:
         return
 
+    faceit_blocked = bool(row[11]) if len(row) > 11 else False
     steam_shared_secret = row[24] if len(row) > 24 else None
-    if not steam_shared_secret:
+    faceit_2fa_secret = row[8] if len(row) > 8 else None
+    order_id = row[40] if len(row) > 40 else None
+
+    code_type = "faceit" if normalized in {"/faceit", "faceit code", "faceit"} else "steam"
+    if code_type == "faceit" and order_id:
+        order_info = _funpay_find_order_record_sync(order_id)
+        if not order_info.get("is_faceit"):
+            return
+
+    if code_type == "steam" and not steam_shared_secret:
+        return
+    if code_type == "faceit" and not faceit_2fa_secret:
+        return
+    if code_type == "faceit" and faceit_blocked:
         return
 
     try:
-        code, _seconds_left = generate_steam_guard_code(decrypt(steam_shared_secret))
+        if code_type == "steam":
+            code, _seconds_left = generate_steam_guard_code(decrypt(steam_shared_secret))
+        else:
+            code, _seconds_left = generate_totp_code(decrypt(faceit_2fa_secret))
     except Exception as e:
         logging.error(f"funpay code generation error: {e}")
         return
 
     try:
-        await asyncio.to_thread(_funpay_send_chat_message_sync, chat_id, f"Steam Guard код: {code}")
+        label = "Steam Guard" if code_type == "steam" else "Faceit"
+        await asyncio.to_thread(_funpay_send_chat_message_sync, chat_id, f"{label} код: {code}")
         cursor.execute(
             "UPDATE accounts SET funpay_order_last_code_sent_at = ? WHERE id = ?",
             (datetime.now(timezone.utc).isoformat(), row[0]),
@@ -2881,7 +3073,7 @@ def detail_actions_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Код Steam"), KeyboardButton(text="Код Faceit")],
-            [KeyboardButton(text="Код в заказ")],
+            [KeyboardButton(text="Код Steam в заказ"), KeyboardButton(text="Код Faceit в заказ")],
             [KeyboardButton(text="Блокировка Faceit"), KeyboardButton(text="Блокировка Steam")],
             [KeyboardButton(text="История аренд"), KeyboardButton(text="Дроп")],
             [KeyboardButton(text="Редактировать"), KeyboardButton(text="Удалить")],
@@ -3483,6 +3675,7 @@ async def account_detail_action(message: types.Message, state: FSMContext):
     data = await state.get_data()
     aid = data.get("selected_id")
     row = get_account_by_id(aid) if aid else None
+    faceit_blocked = bool(row[9]) if row and len(row) > 9 else False
     faceit_2fa_secret = row[22] if row and len(row) > 22 else None
     steam_shared_secret = row[23] if row and len(row) > 23 else None
 
@@ -3563,13 +3756,20 @@ async def account_detail_action(message: types.Message, state: FSMContext):
             reply_markup=copy_buffer_kb(code, "Скопировать код")
         )
 
-    if txt == "код в заказ":
+    if txt in {"код steam в заказ", "код faceit в заказ"}:
         if not row:
             await state.clear()
             return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
 
+        if faceit_blocked:
+            return await message.answer(
+                "Для этого аккаунта Faceit заблокирован, поэтому Faceit-код в заказ не отправляется.",
+                reply_markup=detail_actions_kb()
+            )
+
         chat_id = row[45] if len(row) > 45 else None
         buyer_username = row[44] if len(row) > 44 else None
+        order_id = row[40] if len(row) > 40 else None
         golden_key = resolve_funpay_golden_key()
         if not chat_id and buyer_username and golden_key:
             try:
@@ -3585,23 +3785,17 @@ async def account_detail_action(message: types.Message, state: FSMContext):
                 reply_markup=detail_actions_kb()
             )
 
-        if not steam_shared_secret:
-            return await message.answer(
-                "Для этого аккаунта не сохранён Steam shared secret.",
-                reply_markup=detail_actions_kb()
-            )
-
+        code_type = "steam" if "steam" in txt else "faceit"
         try:
-            code, _seconds_left = generate_steam_guard_code(decrypt(steam_shared_secret))
-        except Exception as e:
-            logging.error(f"steam code error for order: {e}")
-            return await message.answer(
-                "Не удалось сгенерировать Steam код.",
-                reply_markup=detail_actions_kb()
+            result = await asyncio.to_thread(
+                _funpay_send_code_to_order_sync,
+                order_id or "",
+                code_type,
+                steam_shared_secret,
+                faceit_2fa_secret,
             )
-
-        try:
-            await asyncio.to_thread(_funpay_send_chat_message_sync, chat_id, f"Steam Guard код: {code}")
+            if result.get("error"):
+                return await message.answer(str(result["error"]), reply_markup=detail_actions_kb())
             cursor.execute(
                 "UPDATE accounts SET funpay_order_last_code_sent_at = ? WHERE id = ?",
                 (datetime.now(timezone.utc).isoformat(), aid),
@@ -3614,7 +3808,8 @@ async def account_detail_action(message: types.Message, state: FSMContext):
                 reply_markup=detail_actions_kb()
             )
 
-        return await message.answer("Код отправлен в чат заказа FunPay.", reply_markup=detail_actions_kb())
+        label = "Steam" if code_type == "steam" else "Faceit"
+        return await message.answer(f"{label} код отправлен в чат заказа FunPay.", reply_markup=detail_actions_kb())
 
     if txt in {"блокировка faceit", "блокировка steam"}:
         if not row:
@@ -4859,8 +5054,20 @@ async def rent_enter_order(message: types.Message, state: FSMContext):
             f"Steam логин: {s_login}",
             f"Steam пароль: {s_pw}",
         ]
-        should_send_faceit = rent_package == "steam_faceit" and not bool(faceit_blocked)
-        if should_send_faceit and (f_url or f_email or f_pw_enc):
+        order_info = {"is_faceit": False}
+        if order_id:
+            try:
+                order_info = await asyncio.to_thread(_funpay_find_order_record_sync, order_id)
+            except Exception as e:
+                logging.error(f"funpay order lookup error: {e}")
+        order_found = bool(
+            order_info.get("buyer_username")
+            or order_info.get("description")
+            or order_info.get("status")
+            or order_info.get("price")
+        )
+        is_faceit_order = bool(order_info.get("is_faceit")) if order_found else (rent_package == "steam_faceit")
+        if is_faceit_order and not bool(faceit_blocked) and (f_url or f_email or f_pw_enc):
             faceit_email = f_email or "-"
             faceit_password = decrypt(f_pw_enc) if f_pw_enc else "-"
             buyer_text_lines.extend([
@@ -4884,6 +5091,49 @@ async def rent_enter_order(message: types.Message, state: FSMContext):
             "\n".join(buyer_text_lines),
             reply_markup=copy_buffer_kb("\n".join(buyer_copy_lines), "Скопировать в буфер")
         )
+
+        if order_id:
+            faceit_email = f_email or None
+            faceit_password = decrypt(f_pw_enc) if f_pw_enc else None
+            try:
+                init_result = await asyncio.to_thread(
+                    _funpay_send_initial_order_message_sync,
+                    order_id,
+                    s_login,
+                    s_pw,
+                    faceit_email,
+                    faceit_password,
+                    is_faceit_order and not bool(faceit_blocked),
+                )
+                if init_result.get("error"):
+                    logging.error(f"funpay initial order message error: {init_result['error']}")
+                    await message.answer(
+                        f"⚠️ Не удалось отправить стартовые данные в чат заказа FunPay: {init_result['error']}",
+                        reply_markup=main_menu
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE accounts
+                           SET funpay_order_chat_id = ?,
+                               funpay_order_buyer = COALESCE(?, funpay_order_buyer),
+                               funpay_order_status = COALESCE(?, funpay_order_status),
+                               funpay_order_price = COALESCE(?, funpay_order_price),
+                               funpay_order_last_sync_at = ?
+                         WHERE id = ?
+                        """,
+                        (
+                            str(init_result.get("chat_id")) if init_result.get("chat_id") is not None else None,
+                            init_result.get("buyer_username"),
+                            init_result.get("order_status"),
+                            str(init_result.get("order_price")) if init_result.get("order_price") is not None else None,
+                            datetime.now(timezone.utc).isoformat(),
+                            aid,
+                        ),
+                    )
+                    conn.commit()
+            except Exception as e:
+                logging.error(f"funpay initial order message send error: {e}")
 
     await state.clear()
 
