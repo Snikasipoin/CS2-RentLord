@@ -227,8 +227,6 @@ def set_funpay_golden_key(value: str | None) -> None:
     else:
         set_setting_raw("funpay_golden_key", encrypt(value.strip()))
         logging.info("FunPay golden key updated in settings")
-        if MAIN_LOOP is not None and not FUNPAY_LISTENER_THREAD_STARTED:
-            start_funpay_listener(MAIN_LOOP)
 
 
 def resolve_funpay_golden_key() -> str:
@@ -796,7 +794,7 @@ def clean_expired_faceit_blocks():
             """
         )
         expired_ids = []
-        for aid, ends_at_raw in cursor.fetchall():
+        for aid, ends_at_raw in cur.fetchall():
             ends_at = parse_iso_datetime(ends_at_raw)
             if ends_at is None:
                 continue
@@ -838,7 +836,7 @@ def clean_expired_steam_blocks():
             """
         )
         expired_ids = []
-        for aid, ends_at_raw in cursor.fetchall():
+        for aid, ends_at_raw in cur.fetchall():
             ends_at = parse_iso_datetime(ends_at_raw)
             if ends_at is None:
                 continue
@@ -1513,15 +1511,6 @@ def _funpay_send_initial_order_message_sync(
             f"Faceit email: {faceit_email_display}",
             f"Faceit пароль: {faceit_password_display}",
         ])
-
-    order_text_lines.extend([
-        "",
-        "Команды для запроса кодов:",
-        "/steam - запросить Steam Guard код",
-    ])
-    if is_faceit_order and include_faceit:
-        order_text_lines.append("/faceit - запросить Faceit код")
-        order_text_lines.append("Коды отправляются отдельно, при необходимости запросите второй код чуть позже.")
 
     try:
         acc.send_message(chat_id, "\n".join(order_text_lines))
@@ -5821,7 +5810,6 @@ async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     log_runtime_config()
     MAIN_LOOP = asyncio.get_running_loop()
-    start_funpay_listener(MAIN_LOOP)
     asyncio.create_task(checker_loop())
     print("Бот запущен")
     await dp.start_polling(bot, allowed_updates=["message"])
