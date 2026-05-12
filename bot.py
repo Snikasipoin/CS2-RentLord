@@ -1653,6 +1653,12 @@ def format_funpay_order_label(row) -> str:
     return " | ".join(parts)
 
 
+def format_funpay_optional_value(value, linked: bool = False) -> str:
+    if value is None or str(value).strip() == "":
+        return "не получено" if linked else "-"
+    return str(value)
+
+
 def get_rent_statistics_text() -> str:
     cursor.execute(
         """
@@ -3266,9 +3272,10 @@ async def build_account_details_text(row) -> str:
         "FunPay заказ:",
         f"  Номер: {funpay_order_id or '-'}",
         f"  Ссылка: {funpay_order_url or '-'}",
-        f"  Статус: {funpay_order_status or '-'}",
-        f"  Цена: {funpay_order_price or '-'}",
-        f"  Покупатель: {funpay_order_buyer or '-'}",
+        f"  Чат: {'привязан' if funpay_order_chat_id else 'не привязан'}",
+        f"  Статус: {format_funpay_optional_value(funpay_order_status, bool(funpay_order_id))}",
+        f"  Цена: {format_funpay_optional_value(funpay_order_price, bool(funpay_order_id))}",
+        f"  Покупатель: {format_funpay_optional_value(funpay_order_buyer, bool(funpay_order_id))}",
     ])
     if funpay_order_chat_id:
         details_lines.append(f"  Chat ID: {funpay_order_chat_id}")
@@ -3276,6 +3283,8 @@ async def build_account_details_text(row) -> str:
         dt = parse_iso_datetime(funpay_order_last_sync_at)
         if dt:
             details_lines.append(f"  Синхронизация: {dt.astimezone(LOCAL_TIMEZONE).strftime('%d.%m.%Y %H:%M')}")
+    elif funpay_order_id:
+        details_lines.append("  Синхронизация: не получено")
     if funpay_order_last_code_sent_at:
         dt = parse_iso_datetime(funpay_order_last_code_sent_at)
         if dt:
