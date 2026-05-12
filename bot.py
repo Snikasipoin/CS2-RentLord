@@ -1358,6 +1358,7 @@ def _funpay_send_initial_order_message_sync(
     faceit_email: str | None = None,
     faceit_password: str | None = None,
     include_faceit: bool = True,
+    persist_account_id: int | None = None,
     fallback_chat_id: int | str | None = None,
     fallback_buyer_username: str | None = None,
     user_agent: str | None = None,
@@ -1404,6 +1405,22 @@ def _funpay_send_initial_order_message_sync(
         }
 
     is_faceit_order = bool(order.get("is_faceit"))
+
+    if persist_account_id is not None:
+        try:
+            set_funpay_order_context(
+                persist_account_id,
+                order.get("id") or str(order_id).strip().upper(),
+                f"https://funpay.com/orders/{str(order.get('id') or str(order_id).strip().upper())}/",
+                buyer_username,
+                chat_id,
+                order.get("status"),
+                order.get("price"),
+            )
+            conn.commit()
+        except Exception as e:
+            logging.error(f"FunPay order context persist error: {e}")
+
     order_text_lines = [
         "Данные для покупателя:",
         f"Steam логин: {steam_login}",
@@ -1465,6 +1482,7 @@ def _funpay_send_code_to_order_sync(
     code_type: str,
     steam_shared_secret: str | None = None,
     faceit_2fa_secret: str | None = None,
+    persist_account_id: int | None = None,
     fallback_chat_id: int | str | None = None,
     fallback_buyer_username: str | None = None,
     user_agent: str | None = None,
@@ -1512,6 +1530,21 @@ def _funpay_send_code_to_order_sync(
                 extra_error=f"code_type={code_type}",
             )
         }
+
+    if persist_account_id is not None:
+        try:
+            set_funpay_order_context(
+                persist_account_id,
+                order.get("id") or str(order_id).strip().upper(),
+                f"https://funpay.com/orders/{str(order.get('id') or str(order_id).strip().upper())}/",
+                buyer_username,
+                chat_id,
+                order.get("status"),
+                order.get("price"),
+            )
+            conn.commit()
+        except Exception as e:
+            logging.error(f"FunPay order context persist error (code): {e}")
 
     if code_type == "steam":
         if not steam_shared_secret:
@@ -3995,12 +4028,6 @@ async def account_detail_action(message: types.Message, state: FSMContext):
             except Exception as e:
                 logging.error(f"order chat resolve error: {e}")
 
-        if not chat_id:
-            return await message.answer(
-                "Для этого аккаунта ещё не привязан чат заказа FunPay.",
-                reply_markup=detail_actions_kb()
-            )
-
         code_type = "steam" if "steam" in txt else "faceit"
         try:
             result = await asyncio.to_thread(
@@ -4009,6 +4036,7 @@ async def account_detail_action(message: types.Message, state: FSMContext):
                 code_type,
                 steam_shared_secret,
                 faceit_2fa_secret,
+                aid,
             )
             if result.get("error"):
                 return await message.answer(str(result["error"]), reply_markup=detail_actions_kb())
@@ -5323,6 +5351,7 @@ async def rent_enter_order(message: types.Message, state: FSMContext):
                     faceit_email,
                     faceit_password,
                     is_faceit_order and not bool(faceit_blocked),
+                    aid,
                     fallback_chat_id,
                     fallback_buyer_username,
                 )
@@ -5336,7 +5365,7 @@ async def rent_enter_order(message: types.Message, state: FSMContext):
                     cursor.execute(
                         """
                         UPDATE accounts
-                           SET funpay_order_chat_id = ?,
+                           SET funpay_order_chat_id = COALESCE(?, funpay_order_chat_id),
                                funpay_order_buyer = COALESCE(?, funpay_order_buyer),
                                funpay_order_status = COALESCE(?, funpay_order_status),
                                funpay_order_price = COALESCE(?, funpay_order_price),
