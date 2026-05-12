@@ -772,7 +772,7 @@ def status_menu_kb() -> ReplyKeyboardMarkup:
 
 def clean_invalid_dates():
     try:
-        cursor.execute("""
+        conn.execute("""
             UPDATE accounts
                SET status = 'free',
                    rent_end = NULL
@@ -786,7 +786,8 @@ def clean_invalid_dates():
 
 def clean_expired_faceit_blocks():
     try:
-        cursor.execute(
+        cur = conn.cursor()
+        cur.execute(
             """
             SELECT id, faceit_block_ends_at
               FROM accounts
@@ -804,7 +805,7 @@ def clean_expired_faceit_blocks():
                 expired_ids.append(aid)
 
         for aid in expired_ids:
-            cursor.execute(
+            conn.execute(
                 """
                 UPDATE accounts
                    SET faceit_blocked = 0,
@@ -827,7 +828,8 @@ def clean_expired_faceit_blocks():
 
 def clean_expired_steam_blocks():
     try:
-        cursor.execute(
+        cur = conn.cursor()
+        cur.execute(
             """
             SELECT id, steam_block_ends_at
               FROM accounts
@@ -845,7 +847,7 @@ def clean_expired_steam_blocks():
                 expired_ids.append(aid)
 
         for aid in expired_ids:
-            cursor.execute(
+            conn.execute(
                 """
                 UPDATE accounts
                    SET steam_blocked = 0,
@@ -1238,8 +1240,8 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
                     "description": description,
                     "buyer_username": buyer_username,
                     "chat_id": chat_id,
-                    "status": order_status,
-                    "price": order_price,
+                    "status": normalize_db_text(order_status),
+                    "price": normalize_db_text(order_price),
                     "is_faceit": _funpay_detect_faceit_from_text(text_parts),
                     "debug": {
                         "matched": True,
@@ -1289,8 +1291,8 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
             "description": description,
             "buyer_username": buyer_username,
             "chat_id": chat_id,
-            "status": order_status,
-            "price": order_price,
+            "status": normalize_db_text(order_status),
+            "price": normalize_db_text(order_price),
             "is_faceit": _funpay_detect_faceit_from_text(text_parts),
             "debug": {
                 "matched": True,
@@ -1330,8 +1332,8 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
             "description": dialog_text,
             "buyer_username": dialog_user,
             "chat_id": dialog_id,
-            "status": getattr(dialog, "status", None),
-            "price": getattr(dialog, "price", None),
+            "status": normalize_db_text(getattr(dialog, "status", None)),
+            "price": normalize_db_text(getattr(dialog, "price", None)),
             "is_faceit": _funpay_detect_faceit_from_text(dialog_text_parts),
             "debug": {
                 "matched": True,
@@ -1672,10 +1674,10 @@ def set_funpay_order_context(
         (
             order_id,
             order_url,
-            buyer_username,
+            normalize_db_text(buyer_username),
             str(chat_id) if chat_id is not None else None,
-            status,
-            str(price) if price is not None else None,
+            normalize_db_text(status),
+            normalize_db_text(price),
             now_iso,
             aid,
         ),
@@ -1725,6 +1727,19 @@ def format_funpay_optional_value(value, linked: bool = False) -> str:
     if value is None or str(value).strip() == "":
         return "не получено" if linked else "-"
     return str(value)
+
+
+def normalize_db_text(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        text = str(value).strip()
+        return text or None
+    name = getattr(value, "name", None)
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    value_text = str(value).strip()
+    return value_text or None
 
 
 def get_rent_statistics_text() -> str:
@@ -2785,7 +2800,14 @@ def _funpay_listener_thread(loop: asyncio.AbstractEventLoop) -> None:
 
                     if loop.is_running():
                         future = asyncio.run_coroutine_threadsafe(
-                            _funpay_register_new_order(order_id, order_url, buyer_username, chat_id, order_status, str(order_price) if order_price is not None else None),
+                            _funpay_register_new_order(
+                                order_id,
+                                order_url,
+                                buyer_username,
+                                chat_id,
+                                normalize_db_text(order_status),
+                                normalize_db_text(order_price),
+                            ),
                             loop,
                         )
                         try:
