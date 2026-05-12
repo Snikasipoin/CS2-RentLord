@@ -1195,18 +1195,23 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
 
         description = getattr(order, "description", None) or getattr(order, "title", None) or ""
         buyer_username = getattr(order, "buyer_username", None) or getattr(order, "buyer", None)
+        chat_id = getattr(order, "chat_id", None) or getattr(order, "dialog_id", None)
+        if chat_id is None:
+            chat_obj = getattr(order, "chat", None) or getattr(order, "dialog", None)
+            chat_id = getattr(chat_obj, "id", None) if chat_obj is not None else None
         order_status = getattr(order, "status", None) or getattr(order, "state", None)
         order_price = getattr(order, "price", None) or getattr(order, "sum", None)
         return {
             "id": current_id,
             "description": description,
             "buyer_username": buyer_username,
+            "chat_id": chat_id,
             "status": order_status,
             "price": order_price,
             "is_faceit": "faceit" in str(description).lower(),
         }
 
-    return {"id": normalized_id, "description": "", "buyer_username": None, "status": None, "price": None, "is_faceit": False}
+    return {"id": normalized_id, "description": "", "buyer_username": None, "chat_id": None, "status": None, "price": None, "is_faceit": False}
 
 
 def _funpay_send_initial_order_message_sync(
@@ -1216,6 +1221,8 @@ def _funpay_send_initial_order_message_sync(
     faceit_email: str | None = None,
     faceit_password: str | None = None,
     include_faceit: bool = True,
+    fallback_chat_id: int | str | None = None,
+    fallback_buyer_username: str | None = None,
     user_agent: str | None = None,
 ) -> dict:
     golden_key = resolve_funpay_golden_key()
@@ -1227,15 +1234,16 @@ def _funpay_send_initial_order_message_sync(
     if order.get("error"):
         return order
 
-    buyer_username = order.get("buyer_username")
+    buyer_username = order.get("buyer_username") or fallback_buyer_username
+    chat_id = order.get("chat_id") or fallback_chat_id
     chat = None
-    if buyer_username:
+    if chat_id is None and buyer_username:
         try:
             chat = acc.get_chat_by_name(buyer_username, True)
         except Exception as e:
             return {"error": f"Не удалось получить чат заказа: {e}"}
 
-    chat_id = getattr(chat, "id", None)
+        chat_id = getattr(chat, "id", None)
     if not chat_id:
         return {"error": "Не удалось определить чат заказа"}
 
@@ -1294,6 +1302,8 @@ def _funpay_send_code_to_order_sync(
     code_type: str,
     steam_shared_secret: str | None = None,
     faceit_2fa_secret: str | None = None,
+    fallback_chat_id: int | str | None = None,
+    fallback_buyer_username: str | None = None,
     user_agent: str | None = None,
 ) -> dict:
     golden_key = resolve_funpay_golden_key()
@@ -1308,15 +1318,16 @@ def _funpay_send_code_to_order_sync(
     if code_type == "faceit" and not order.get("is_faceit"):
         return {"error": "Этот заказ не FACEIT, код Faceit не требуется."}
 
-    buyer_username = order.get("buyer_username")
+    buyer_username = order.get("buyer_username") or fallback_buyer_username
+    chat_id = order.get("chat_id") or fallback_chat_id
     chat = None
-    if buyer_username:
+    if chat_id is None and buyer_username:
         try:
             chat = acc.get_chat_by_name(buyer_username, True)
         except Exception as e:
             return {"error": f"Не удалось получить чат заказа: {e}"}
 
-    chat_id = getattr(chat, "id", None)
+        chat_id = getattr(chat, "id", None)
     if not chat_id:
         return {"error": "Не удалось определить чат заказа"}
 
@@ -2441,11 +2452,14 @@ def _funpay_listener_thread(loop: asyncio.AbstractEventLoop) -> None:
                     order = getattr(event, "order", None)
                     order_id = str(getattr(order, "id", "") or "").strip().upper() or None
                     buyer_username = getattr(order, "buyer_username", None)
+                    chat_id = getattr(order, "chat_id", None) or getattr(order, "dialog_id", None)
+                    if chat_id is None:
+                        chat_obj = getattr(order, "chat", None) or getattr(order, "dialog", None)
+                        chat_id = int(getattr(chat_obj, "id", None) or 0) or None
                     order_status = getattr(order, "status", None) or getattr(order, "state", None)
                     order_price = getattr(order, "price", None) or getattr(order, "sum", None)
                     order_url = f"https://funpay.com/orders/{order_id}/" if order_id else None
-                    chat_id = None
-                    if buyer_username:
+                    if chat_id is None and buyer_username:
                         try:
                             chat = acc.get_chat_by_name(buyer_username, True)
                             chat_id = int(getattr(chat, "id", None) or 0) or None
@@ -5093,6 +5107,9 @@ async def rent_enter_order(message: types.Message, state: FSMContext):
         )
 
         if order_id:
+            account_snapshot = get_account_by_id(aid)
+            fallback_chat_id = account_snapshot[45] if account_snapshot and len(account_snapshot) > 45 else None
+            fallback_buyer_username = account_snapshot[44] if account_snapshot and len(account_snapshot) > 44 else None
             faceit_email = f_email or None
             faceit_password = decrypt(f_pw_enc) if f_pw_enc else None
             try:
@@ -5104,6 +5121,8 @@ async def rent_enter_order(message: types.Message, state: FSMContext):
                     faceit_email,
                     faceit_password,
                     is_faceit_order and not bool(faceit_blocked),
+                    fallback_chat_id,
+                    fallback_buyer_username,
                 )
                 if init_result.get("error"):
                     logging.error(f"funpay initial order message error: {init_result['error']}")
