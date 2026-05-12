@@ -1439,7 +1439,14 @@ def _funpay_send_initial_order_message_sync(
     try:
         acc.send_message(chat_id, "\n".join(order_text_lines))
     except Exception as e:
-        return {"error": f"Не удалось отправить данные в чат заказа: {e}"}
+        err_text = str(e)
+        if "NoneType" in err_text and "text" in err_text:
+            logging.warning(
+                "FunPay initial order message sent, but library raised harmless error: %s",
+                err_text,
+            )
+        else:
+            return {"error": f"Не удалось отправить данные в чат заказа: {e}"}
 
     return {
         "success": True,
@@ -1519,7 +1526,17 @@ def _funpay_send_code_to_order_sync(
     else:
         return {"error": "Неизвестный тип кода"}
 
-    acc.send_message(chat_id, message_text)
+    try:
+        acc.send_message(chat_id, message_text)
+    except Exception as e:
+        err_text = str(e)
+        if "NoneType" in err_text and "text" in err_text:
+            logging.warning(
+                "FunPay code sent, but library raised harmless error: %s",
+                err_text,
+            )
+        else:
+            return {"error": f"Не удалось отправить код в чат заказа: {e}"}
     return {
         "success": True,
         "chat_id": chat_id,
@@ -2497,7 +2514,17 @@ def _funpay_send_chat_message_sync(chat_id: int | str, message_text: str, user_a
         raise RuntimeError("FunPay golden key не задан")
 
     acc = _funpay_build_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
-    acc.send_message(int(chat_id), message_text)
+    try:
+        acc.send_message(int(chat_id), message_text)
+    except Exception as e:
+        err_text = str(e)
+        if "NoneType" in err_text and "text" in err_text:
+            logging.warning(
+                "FunPay chat message sent, but library raised harmless error: %s",
+                err_text,
+            )
+            return
+        raise
 
 
 async def _funpay_register_new_order(
