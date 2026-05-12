@@ -2595,12 +2595,19 @@ async def _funpay_handle_chat_message(
     author_id: int | None,
     text: str | None,
 ) -> None:
-    if chat_id is None or author_id is None:
+    if chat_id is None:
         return
 
     normalized = (text or "").strip().lower()
     if normalized not in {"/code", "/steam", "/faceit", "код", "code", "steam code", "steam", "faceit code", "faceit"}:
         return
+
+    logging.info(
+        "FunPay incoming chat message: chat_id=%s author_id=%s text=%r",
+        chat_id,
+        author_id,
+        text,
+    )
 
     cursor.execute(
         """
@@ -2614,6 +2621,7 @@ async def _funpay_handle_chat_message(
     )
     row = cursor.fetchone()
     if not row:
+        logging.warning("FunPay chat message ignored: no account bound to chat_id=%s", chat_id)
         return
 
     if row[0] is None:
