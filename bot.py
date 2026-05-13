@@ -1491,10 +1491,12 @@ def _funpay_send_initial_order_message_sync(
 
     order_text_lines = [
         "Данные для покупателя:",
+        f"Аккаунт: {steam_login}",
         f"Steam логин: {steam_login}",
         f"Steam пароль: {steam_password}",
     ]
     order_copy_lines = [
+        f"Аккаунт: {steam_login}",
         f"Steam логин: {steam_login}",
         f"Steam пароль: {steam_password}",
     ]
@@ -1539,6 +1541,7 @@ def _funpay_send_initial_order_message_sync(
 def _funpay_send_code_to_order_sync(
     order_id: str,
     code_type: str,
+    account_login: str | None = None,
     steam_shared_secret: str | None = None,
     faceit_2fa_secret: str | None = None,
     persist_account_id: int | None = None,
@@ -1609,12 +1612,12 @@ def _funpay_send_code_to_order_sync(
         if not steam_shared_secret:
             return {"error": "Steam shared secret не задан"}
         code, _seconds_left = generate_steam_guard_code(decrypt(steam_shared_secret))
-        message_text = f"Steam Guard код: {code}"
+        message_text = f"Steam Guard код" + (f" для аккаунта {account_login}" if account_login else "") + f": {code}"
     elif code_type == "faceit":
         if not faceit_2fa_secret:
             return {"error": "Faceit 2FA secret не задан"}
         code, _seconds_left = generate_totp_code(decrypt(faceit_2fa_secret))
-        message_text = f"Faceit код: {code}"
+        message_text = f"Faceit код" + (f" для аккаунта {account_login}" if account_login else "") + f": {code}"
     else:
         return {"error": "Неизвестный тип кода"}
 
@@ -1670,6 +1673,22 @@ def set_funpay_order_context(
             now_iso,
             aid,
         ),
+    )
+
+
+def mark_funpay_order_notification_for_busy_accounts(order_id: str | None, column_name: str, value: str) -> None:
+    if not order_id:
+        return
+    if column_name not in {"rent_reminder_5m_sent_at", "rent_overdue_notified_at"}:
+        raise ValueError("Unsupported notification column")
+    cursor.execute(
+        f"""
+        UPDATE accounts
+           SET {column_name} = ?
+         WHERE status = 'busy'
+           AND funpay_order_id = ?
+        """,
+        (value, order_id),
     )
 
 
@@ -4150,6 +4169,7 @@ async def account_detail_action(message: types.Message, state: FSMContext):
                 _funpay_send_code_to_order_sync,
                 order_id or "",
                 code_type,
+                row[0],
                 steam_shared_secret,
                 faceit_2fa_secret,
                 aid,
@@ -5407,10 +5427,12 @@ async def rent_enter_order(message: types.Message, state: FSMContext):
         s_pw = decrypt(s_pw_enc)
         buyer_text_lines = [
             "Данные для покупателя:",
+            f"Аккаунт: {login}",
             f"Steam логин: {s_login}",
             f"Steam пароль: {s_pw}",
         ]
         buyer_copy_lines = [
+            f"Аккаунт: {login}",
             f"Steam логин: {s_login}",
             f"Steam пароль: {s_pw}",
         ]
@@ -5657,6 +5679,8 @@ async def checker_loop():
             if DB_MAINTENANCE:
                 await asyncio.sleep(5)
                 continue
+            seen_rent_reminder_orders: set[str] = set()
+            seen_overdue_orders: set[str] = set()
             clean_invalid_dates()
             clean_expired_faceit_blocks()
             clean_expired_steam_blocks()
@@ -5667,6 +5691,7 @@ async def checker_loop():
                        rent_end,
                        COALESCE(rent_reminder_5m_sent_at, ''),
                        COALESCE(rent_overdue_notified_at, ''),
+                       funpay_order_id,
                        funpay_order_chat_id,
                        funpay_order_buyer,
                        funpay_order_status,
@@ -5682,20 +5707,51 @@ async def checker_loop():
                     left = (end - datetime.now()).total_seconds()
                     reminder_sent_at = row[3] if len(row) > 3 else ""
                     overdue_sent_at = row[4] if len(row) > 4 else ""
-                    funpay_chat_id = row[5] if len(row) > 5 else None
-                    funpay_buyer = row[6] if len(row) > 6 else None
-                    funpay_order_status = row[7] if len(row) > 7 else None
-                    steam_presence_state = row[8] if len(row) > 8 else None
-                    steam_presence_game = row[9] if len(row) > 9 else None
+                    funpay_order_id = row[5] if len(row) > 5 else None
+                    funpay_chat_id = row[6] if len(row) > 6 else None
+                    funpay_buyer = row[7] if len(row) > 7 else None
+                    funpay_order_status = row[8] if len(row) > 8 else None
+                    steam_presence_state = row[9] if len(row) > 9 else None
+                    steam_presence_game = row[10] if len(row) > 10 else None
 
-                    if 240 < left < 300 and not reminder_sent_at:
-                        reminder_text = f"⚠️ {row[1]} — до конца аренды осталось около 5 минут. Пожалуйста, продлите аренду, если планируете продолжать."
+                    order_scope_reminder = bool(funpay_order_id and funpay_order_id not in seen_rent_reminder_orders)
+                    if 240 < left < 300 and not reminder_sent_at and order_scope_reminder:
+                        order_accounts = 1
+                        if funpay_order_id:
+                            cursor.execute(
+                                """
+                                SELECT COUNT(*)
+                                  FROM accounts
+                                 WHERE status = 'busy'
+                                   AND funpay_order_id = ?
+                                """,
+                                (funpay_order_id,),
+                            )
+                            count_row = cursor.fetchone()
+                            order_accounts = int(count_row[0] or 1) if count_row else 1
+                        reminder_text = (
+                            f"⚠️ {row[1]} — до конца аренды осталось около 5 минут. "
+                            "Пожалуйста, продлите аренду, если планируете продолжать."
+                        )
+                        if funpay_order_id:
+                            reminder_text += f"\nFunPay заказ: {funpay_order_id}"
+                            if order_accounts > 1:
+                                reminder_text += f" ({order_accounts} аккаунта)"
                         for admin_id in ADMIN_IDS:
                             await bot.send_message(admin_id, reminder_text)
-                        cursor.execute(
-                            "UPDATE accounts SET rent_reminder_5m_sent_at = ? WHERE id = ?",
-                            (datetime.now(timezone.utc).isoformat(), row[0]),
-                        )
+                        reminder_stamp = datetime.now(timezone.utc).isoformat()
+                        if funpay_order_id:
+                            mark_funpay_order_notification_for_busy_accounts(
+                                funpay_order_id,
+                                "rent_reminder_5m_sent_at",
+                                reminder_stamp,
+                            )
+                            seen_rent_reminder_orders.add(funpay_order_id)
+                        else:
+                            cursor.execute(
+                                "UPDATE accounts SET rent_reminder_5m_sent_at = ? WHERE id = ?",
+                                (reminder_stamp, row[0]),
+                            )
                         conn.commit()
                         if funpay_chat_id:
                             try:
@@ -5711,8 +5767,9 @@ async def checker_loop():
                         presence_label = format_steam_presence_label(steam_presence_state, steam_presence_game)
                         is_in_game = presence_label.startswith("в игре")
                         order_closed = is_funpay_order_closed(funpay_order_status)
+                        order_scope_overdue = bool(funpay_order_id and funpay_order_id not in seen_overdue_orders)
 
-                        if not overdue_sent_at:
+                        if not overdue_sent_at and order_scope_overdue:
                             final_order_text = (
                                 "✅ Время аренды закончилось. Спасибо за обращение! "
                                 "Будем рады видеть вас снова."
@@ -5730,27 +5787,39 @@ async def checker_loop():
                                     )
                                 except Exception as e:
                                     logging.error(f"funpay overdue send error: {e}")
+                            overdue_stamp = datetime.now(timezone.utc).isoformat()
+                            if funpay_order_id:
+                                mark_funpay_order_notification_for_busy_accounts(
+                                    funpay_order_id,
+                                    "rent_overdue_notified_at",
+                                    overdue_stamp,
+                                )
+                                seen_overdue_orders.add(funpay_order_id)
 
                         if is_in_game:
-                            if not overdue_sent_at:
+                            if not overdue_sent_at and order_scope_overdue:
                                 warning_text = (
                                     f"⚠️ Время аренды для {row[1]} закончилось, "
                                     f"но аккаунт всё ещё в игре ({presence_label}). "
                                     "Пожалуйста, продлите аренду или завершите сессию."
                                 )
+                                if funpay_order_id:
+                                    warning_text += f"\nFunPay заказ: {funpay_order_id}"
                                 for admin_id in ADMIN_IDS:
                                     await bot.send_message(admin_id, warning_text)
-                                cursor.execute(
-                                    "UPDATE accounts SET rent_overdue_notified_at = ? WHERE id = ?",
-                                    (datetime.now(timezone.utc).isoformat(), row[0]),
-                                )
+                                if not funpay_order_id:
+                                    cursor.execute(
+                                        "UPDATE accounts SET rent_overdue_notified_at = ? WHERE id = ?",
+                                        (datetime.now(timezone.utc).isoformat(), row[0]),
+                                    )
                                 conn.commit()
                         else:
                             if not overdue_sent_at:
-                                cursor.execute(
-                                    "UPDATE accounts SET rent_overdue_notified_at = ? WHERE id = ?",
-                                    (datetime.now(timezone.utc).isoformat(), row[0]),
-                                )
+                                if not funpay_order_id:
+                                    cursor.execute(
+                                        "UPDATE accounts SET rent_overdue_notified_at = ? WHERE id = ?",
+                                        (datetime.now(timezone.utc).isoformat(), row[0]),
+                                    )
                                 conn.commit()
                             cursor.execute("UPDATE accounts SET status='free', rent_end=NULL WHERE id=?", (row[0],))
                             close_open_rent_history(row[0], datetime.now(), "auto_free")
