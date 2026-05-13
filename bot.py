@@ -1491,12 +1491,10 @@ def _funpay_send_initial_order_message_sync(
 
     order_text_lines = [
         "Данные для покупателя:",
-        f"Аккаунт: {steam_login}",
         f"Steam логин: {steam_login}",
         f"Steam пароль: {steam_password}",
     ]
     order_copy_lines = [
-        f"Аккаунт: {steam_login}",
         f"Steam логин: {steam_login}",
         f"Steam пароль: {steam_password}",
     ]
@@ -3275,11 +3273,23 @@ def get_rentable_accounts() -> list[tuple]:
     return cursor.fetchall()
 
 
-def determine_rent_package(faceit_url: str | None, faceit_email: str | None, faceit_password: str | None, faceit_blocked: bool) -> str:
+def determine_rent_package(
+    faceit_url: str | None,
+    faceit_email: str | None,
+    faceit_password: str | None,
+    faceit_blocked: bool,
+    steam_blocked: bool,
+) -> str | None:
     has_faceit = any(
         value and str(value).strip()
         for value in (faceit_url, faceit_email, faceit_password)
     )
+
+    if steam_blocked and not has_faceit:
+        return None
+
+    if not has_faceit and faceit_blocked:
+        return None
 
     if faceit_blocked or not has_faceit:
         return "steam"
@@ -4145,12 +4155,6 @@ async def account_detail_action(message: types.Message, state: FSMContext):
             await state.clear()
             return await message.answer("Аккаунт не найден.", reply_markup=main_menu)
 
-        if faceit_blocked:
-            return await message.answer(
-                "Для этого аккаунта Faceit заблокирован, поэтому Faceit-код в заказ не отправляется.",
-                reply_markup=detail_actions_kb()
-            )
-
         chat_id = row[45] if len(row) > 45 else None
         buyer_username = row[44] if len(row) > 44 else None
         order_id = row[40] if len(row) > 40 else None
@@ -4164,6 +4168,12 @@ async def account_detail_action(message: types.Message, state: FSMContext):
                 logging.error(f"order chat resolve error: {e}")
 
         code_type = "steam" if "steam" in txt else "faceit"
+        if code_type == "faceit" and faceit_blocked:
+            return await message.answer(
+                "Для этого аккаунта Faceit заблокирован, поэтому Faceit-код в заказ не отправляется.",
+                reply_markup=detail_actions_kb()
+            )
+
         try:
             result = await asyncio.to_thread(
                 _funpay_send_code_to_order_sync,
@@ -5275,7 +5285,15 @@ async def rent_start(message: types.Message, state: FSMContext):
     keyboard_rows = []
 
     for aid, login, faceit_url, faceit_email, faceit_password, faceit_blocked, steam_blocked in rows:
-        package = determine_rent_package(faceit_url, faceit_email, faceit_password, bool(faceit_blocked))
+        package = determine_rent_package(
+            faceit_url,
+            faceit_email,
+            faceit_password,
+            bool(faceit_blocked),
+            bool(steam_blocked),
+        )
+        if package is None:
+            continue
         rows_data.append({
             "id": aid,
             "login": login,
@@ -5427,12 +5445,10 @@ async def rent_enter_order(message: types.Message, state: FSMContext):
         s_pw = decrypt(s_pw_enc)
         buyer_text_lines = [
             "Данные для покупателя:",
-            f"Аккаунт: {login}",
             f"Steam логин: {s_login}",
             f"Steam пароль: {s_pw}",
         ]
         buyer_copy_lines = [
-            f"Аккаунт: {login}",
             f"Steam логин: {s_login}",
             f"Steam пароль: {s_pw}",
         ]
