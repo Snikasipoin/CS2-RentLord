@@ -5869,6 +5869,10 @@ async def checker_loop():
 #  FunPay service wiring
 # ────────────────────────────────────────────────
 
+_BOT_RESOLVE_FUNPAY_GOLDEN_KEY = resolve_funpay_golden_key
+_BOT_RESOLVE_FUNPAY_USER_AGENT = resolve_funpay_user_agent
+_BOT_GET_FUNPAY_OP_LOCK = get_funpay_op_lock
+
 from services.funpay_manager import (
     FunPayRuntime,
     configure as configure_funpay_manager,
@@ -5914,9 +5918,9 @@ async def main():
         FunPayRuntime(
             conn=conn,
             cursor=cursor,
-            resolve_funpay_golden_key=resolve_funpay_golden_key,
-            resolve_funpay_user_agent=resolve_funpay_user_agent,
-            get_funpay_op_lock=get_funpay_op_lock,
+            resolve_funpay_golden_key=_BOT_RESOLVE_FUNPAY_GOLDEN_KEY,
+            resolve_funpay_user_agent=_BOT_RESOLVE_FUNPAY_USER_AGENT,
+            get_funpay_op_lock=_BOT_GET_FUNPAY_OP_LOCK,
             decrypt=decrypt,
             generate_steam_guard_code=generate_steam_guard_code,
             generate_totp_code=generate_totp_code,
