@@ -120,13 +120,14 @@ def _clear_funpay_auto_raise_schedule() -> None:
 
 def funpay_toggle_auto_raise() -> bool:
     global _FUNPAY_AUTO_RAISE_LAST_RUN
-    value = _ctx().cursor.execute(
+    cursor = _ctx().conn.cursor()
+    value = cursor.execute(
         "SELECT value FROM settings WHERE key = ?",
         ("funpay_auto_raise_enabled",),
     ).fetchone()
     enabled = bool(value and str(value[0]).strip().lower() in {"1", "true", "yes", "on"})
     new_value = not enabled
-    _ctx().cursor.execute(
+    cursor.execute(
         """
         INSERT INTO settings(key, value)
         VALUES (?, ?)
@@ -146,7 +147,11 @@ def funpay_toggle_auto_raise() -> bool:
 
 
 def get_funpay_auto_raise_enabled() -> bool:
-    row = _ctx().cursor.execute("SELECT value FROM settings WHERE key = ?", ("funpay_auto_raise_enabled",)).fetchone()
+    cursor = _ctx().conn.cursor()
+    row = cursor.execute(
+        "SELECT value FROM settings WHERE key = ?",
+        ("funpay_auto_raise_enabled",),
+    ).fetchone()
     return bool(row and str(row[0]).strip().lower() in {"1", "true", "yes", "on"})
 
 
@@ -949,6 +954,12 @@ def _funpay_listener_thread(loop: asyncio.AbstractEventLoop) -> None:
         return
     try:
         acc = _funpay_build_account_sync(golden_key, resolve_funpay_user_agent())
+        if hasattr(acc, "get"):
+            try:
+                acc.get()
+            except Exception as e:
+                logging.error("FunPay account init error: %s", e)
+                return
         runner = FunPayRunner(acc)
     except Exception as e:
         logging.error("FunPay listener init error: %s", e)
@@ -956,7 +967,7 @@ def _funpay_listener_thread(loop: asyncio.AbstractEventLoop) -> None:
     _FUNPAY_LISTENER_THREAD_STARTED = True
     logging.info("FunPay listener started")
     try:
-        for event in runner.listen():
+        for event in runner.listen(requests_delay=4):
             try:
                 event_type = getattr(event, "type", None) or getattr(event, "event_type", None)
                 if event_type == getattr(FunPayEnums.EventTypes, "NEW_ORDER", None):
