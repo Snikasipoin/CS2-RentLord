@@ -157,7 +157,10 @@ def get_funpay_auto_raise_enabled() -> bool:
 
 def _funpay_build_account_sync(golden_key: str, user_agent: str | None = None):
     funpay_ensure_available()
-    return FunPayAccount(golden_key, user_agent=user_agent or None)
+    acc = FunPayAccount(golden_key, user_agent=user_agent or None)
+    if hasattr(acc, "get"):
+        acc.get()
+    return acc
 
 
 def _funpay_collect_text_parts(obj, field_names: list[str]) -> list[str]:
