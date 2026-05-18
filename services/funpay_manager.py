@@ -163,6 +163,51 @@ def _funpay_build_account_sync(golden_key: str, user_agent: str | None = None):
     return acc
 
 
+def _funpay_extract_chat_id(chat_obj: Any) -> int | str | None:
+    if chat_obj is None:
+        return None
+    if isinstance(chat_obj, (int, str)):
+        raw = str(chat_obj).strip()
+        return int(raw) if raw.isdigit() else raw or None
+    for attr_name in ("id", "chat_id", "dialog_id"):
+        value = getattr(chat_obj, attr_name, None)
+        if value is None:
+            continue
+        raw = str(value).strip()
+        if not raw:
+            continue
+        return int(raw) if raw.isdigit() else raw
+    return None
+
+
+def _funpay_resolve_chat_by_buyer_name(acc, buyer_username: str | None) -> int | str | None:
+    buyer_username = (buyer_username or "").strip()
+    if not buyer_username:
+        return None
+
+    method = getattr(acc, "get_chat_by_name", None)
+    if method is None:
+        return None
+
+    call_variants = [
+        (buyer_username, True),
+        (buyer_username, False),
+        (buyer_username,),
+    ]
+    for args in call_variants:
+        try:
+            chat_obj = method(*args)
+        except TypeError:
+            continue
+        except Exception as e:
+            logging.error("FunPay chat resolve error by buyer name (%s): %s", buyer_username, e)
+            continue
+        chat_id = _funpay_extract_chat_id(chat_obj)
+        if chat_id is not None:
+            return chat_id
+    return None
+
+
 def _funpay_collect_text_parts(obj, field_names: list[str]) -> list[str]:
     parts: list[str] = []
     for field_name in field_names:
@@ -455,10 +500,9 @@ def _funpay_send_initial_order_message_sync(
 
     buyer_username = order.get("buyer_username") or fallback_buyer_username
     chat_id = order.get("chat_id") or fallback_chat_id
-    chat = None
     if chat_id is None and buyer_username:
         try:
-            chat = acc.get_chat_by_name(buyer_username, True)
+            chat_id = _funpay_resolve_chat_by_buyer_name(acc, buyer_username)
         except Exception as e:
             return {
                 "error": "Не удалось получить чат заказа\n"
@@ -471,7 +515,6 @@ def _funpay_send_initial_order_message_sync(
                     extra_error=str(e),
                 )
             }
-        chat_id = getattr(chat, "id", None)
     if not chat_id:
         return {
             "error": "Не удалось определить чат заказа\n"
@@ -563,10 +606,9 @@ def _funpay_send_code_to_order_sync(
 
     buyer_username = order.get("buyer_username") or fallback_buyer_username
     chat_id = order.get("chat_id") or fallback_chat_id
-    chat = None
     if chat_id is None and buyer_username:
         try:
-            chat = acc.get_chat_by_name(buyer_username, True)
+            chat_id = _funpay_resolve_chat_by_buyer_name(acc, buyer_username)
         except Exception as e:
             return {
                 "error": "Не удалось получить чат заказа\n"
@@ -579,7 +621,6 @@ def _funpay_send_code_to_order_sync(
                     extra_error=str(e),
                 )
             }
-        chat_id = getattr(chat, "id", None)
     if not chat_id:
         return {
             "error": "Не удалось определить чат заказа\n"
