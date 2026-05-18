@@ -5091,15 +5091,15 @@ async def show_status(message: types.Message, state: FSMContext):
     clean_expired_faceit_blocks()
     clean_expired_steam_blocks()
 
-    cursor.execute(
-        """
-        SELECT COUNT(*)
-          FROM accounts
-         WHERE status='free'
-           AND NOT (COALESCE(steam_blocked, 0) = 1 AND COALESCE(faceit_blocked, 0) = 1)
-        """
-    )
-    rentable_accounts = cursor.fetchone()[0]
+    rentable_accounts = 0
+    for row in get_rentable_accounts():
+        faceit_url = row[2] if len(row) > 2 else None
+        faceit_email = row[3] if len(row) > 3 else None
+        faceit_password = row[4] if len(row) > 4 else None
+        faceit_blocked = bool(row[5]) if len(row) > 5 and row[5] is not None else False
+        steam_blocked = bool(row[6]) if len(row) > 6 and row[6] is not None else False
+        if determine_rent_package(faceit_url, faceit_email, faceit_password, faceit_blocked, steam_blocked) is not None:
+            rentable_accounts += 1
     cursor.execute("SELECT COUNT(*) FROM accounts WHERE status='busy'")
     busy = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM accounts WHERE COALESCE(faceit_blocked, 0) = 1")
