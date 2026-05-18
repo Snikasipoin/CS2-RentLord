@@ -1060,28 +1060,25 @@ def start_funpay_listener(loop: asyncio.AbstractEventLoop) -> None:
 
 async def run_funpay_worker() -> None:
     logging.info("FunPay polling worker started")
-    loop = asyncio.get_running_loop()
     while True:
         try:
             golden_key = resolve_funpay_golden_key()
             if golden_key:
-                if not _FUNPAY_LISTENER_THREAD_STARTED or (_FUNPAY_LISTENER_THREAD and not _FUNPAY_LISTENER_THREAD.is_alive()):
-                    start_funpay_listener(loop)
                 if get_funpay_auto_raise_enabled():
                     if _FUNPAY_AUTO_RAISE_NEXT_RUN_TS <= 0:
-                        _schedule_next_funpay_auto_raise(loop.time(), "warmup")
-                    if loop.time() >= _FUNPAY_AUTO_RAISE_NEXT_RUN_TS:
+                        _schedule_next_funpay_auto_raise(asyncio.get_running_loop().time(), "warmup")
+                    if asyncio.get_running_loop().time() >= _FUNPAY_AUTO_RAISE_NEXT_RUN_TS:
                         raise_result = await funpay_raise_all_lots()
                         if raise_result.get("error"):
                             logging.error("FunPay auto raise error: %s", raise_result["error"])
-                            _schedule_next_funpay_auto_raise(loop.time(), "error")
+                            _schedule_next_funpay_auto_raise(asyncio.get_running_loop().time(), "error")
                         else:
                             logging.info("FunPay auto raise completed: raised=%s errors=%s selected=%s total=%s",
                                          raise_result.get("raised"),
                                          raise_result.get("errors"),
                                          raise_result.get("selected_categories"),
                                          raise_result.get("total_categories"))
-                            _schedule_next_funpay_auto_raise(loop.time(), "normal")
+                            _schedule_next_funpay_auto_raise(asyncio.get_running_loop().time(), "normal")
             else:
                 _clear_funpay_auto_raise_schedule()
         except Exception as e:
