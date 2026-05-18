@@ -282,6 +282,8 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
                 if chat_id is None:
                     chat_obj = getattr(direct_order, "chat", None) or getattr(direct_order, "dialog", None)
                     chat_id = getattr(chat_obj, "id", None) if chat_obj is not None else None
+                if chat_id is None and buyer_username:
+                    chat_id = _funpay_resolve_chat_by_buyer_name(acc, buyer_username)
                 order_status = getattr(direct_order, "status", None) or getattr(direct_order, "state", None)
                 order_price = getattr(direct_order, "price", None) or getattr(direct_order, "sum", None)
                 return {
@@ -329,6 +331,8 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
         if chat_id is None:
             chat_obj = getattr(order, "chat", None) or getattr(order, "dialog", None)
             chat_id = getattr(chat_obj, "id", None) if chat_obj is not None else None
+        if chat_id is None and buyer_username:
+            chat_id = _funpay_resolve_chat_by_buyer_name(acc, buyer_username)
         order_status = getattr(order, "status", None) or getattr(order, "state", None)
         order_price = getattr(order, "price", None) or getattr(order, "sum", None)
         return {
@@ -1022,6 +1026,8 @@ def _funpay_listener_thread(loop: asyncio.AbstractEventLoop) -> None:
                     if chat_id is None:
                         chat_obj = getattr(order, "chat", None) or getattr(order, "dialog", None)
                         chat_id = getattr(chat_obj, "id", None) if chat_obj is not None else None
+                    if chat_id is None and buyer_username:
+                        chat_id = _funpay_resolve_chat_by_buyer_name(acc, buyer_username)
                     order_url = f"https://funpay.com/orders/{order_id}/" if order_id else None
                     order_status = getattr(order, "status", None) or getattr(order, "state", None)
                     order_price = getattr(order, "price", None) or getattr(order, "sum", None)
