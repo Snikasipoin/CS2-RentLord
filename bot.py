@@ -5861,56 +5861,33 @@ async def checker_loop():
                     logging.error(f"steam_presence_sync: {e}")
                 last_steam_presence_scan = now_ts
 
-            if get_funpay_auto_raise_enabled():
-                golden_key = resolve_funpay_golden_key()
-                if golden_key:
-                    if FUNPAY_AUTO_RAISE_NEXT_RUN_TS <= 0:
-                        _schedule_next_funpay_auto_raise(now_ts, "warmup")
-
-                    if now_ts >= FUNPAY_AUTO_RAISE_NEXT_RUN_TS:
-                        raise_result = await funpay_raise_all_lots()
-                        if raise_result.get("error"):
-                            logging.error("FunPay auto raise error: %s", raise_result["error"])
-                            next_delay = _schedule_next_funpay_auto_raise(now_ts, "error")
-                            next_in = format_interval_seconds(next_delay)
-                            for admin_id in ADMIN_IDS:
-                                await bot.send_message(
-                                    admin_id,
-                                    "⚠️ Автоподъем лотов FunPay завершился с ошибкой:\n"
-                                    f"{raise_result['error']}\n"
-                                    f"Повторная попытка через: {next_in}"
-                                )
-                        else:
-                            next_delay = _schedule_next_funpay_auto_raise(now_ts, "normal")
-                            next_in = format_interval_seconds(next_delay)
-                            raised_count = len(raise_result.get("raised", []))
-                            errors_count = len(raise_result.get("errors", []))
-                            selected_categories = int(raise_result.get("selected_categories") or 0)
-                            total_categories = int(raise_result.get("total_categories") or 0)
-                            logging.info(
-                                "FunPay auto raise completed: raised=%d errors=%d selected=%d total=%d",
-                                raised_count,
-                                errors_count,
-                                selected_categories,
-                                total_categories,
-                            )
-                            for admin_id in ADMIN_IDS:
-                                await bot.send_message(
-                                    admin_id,
-                                    "✅ Произошел автоподъем лотов FunPay.\n"
-                                    f"Обработано категорий: {selected_categories} из {total_categories}\n"
-                                    f"Успешно поднято: {raised_count}\n"
-                                    f"Ошибок: {errors_count}\n"
-                                    f"Следующий автоподъем через: {next_in}"
-                                )
-                        FUNPAY_AUTO_RAISE_LAST_RUN = now_ts
-                else:
-                    _clear_funpay_auto_raise_schedule()
-            else:
-                _clear_funpay_auto_raise_schedule()
         except Exception as e:
             logging.error(f"checker_loop: {e}")
         await asyncio.sleep(30)
+
+# ────────────────────────────────────────────────
+#  FunPay service wiring
+# ────────────────────────────────────────────────
+
+from services.funpay_manager import (
+    FunPayRuntime,
+    configure as configure_funpay_manager,
+    run_funpay_worker,
+    funpay_get_balance,
+    funpay_raise_all_lots,
+    funpay_toggle_auto_raise,
+    get_funpay_next_auto_raise_in,
+    resolve_funpay_golden_key,
+    resolve_funpay_user_agent,
+    _funpay_build_account_sync,
+    _funpay_send_chat_message_sync,
+    _funpay_find_order_record_sync,
+    _funpay_send_initial_order_message_sync,
+    _funpay_send_code_to_order_sync,
+    start_funpay_listener,
+    funpay_ensure_available,
+    get_funpay_op_lock,
+)
 
 # ────────────────────────────────────────────────
 #  Запуск
@@ -5933,7 +5910,29 @@ async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     log_runtime_config()
     MAIN_LOOP = asyncio.get_running_loop()
+    configure_funpay_manager(
+        FunPayRuntime(
+            conn=conn,
+            cursor=cursor,
+            resolve_funpay_golden_key=resolve_funpay_golden_key,
+            resolve_funpay_user_agent=resolve_funpay_user_agent,
+            get_funpay_op_lock=get_funpay_op_lock,
+            decrypt=decrypt,
+            generate_steam_guard_code=generate_steam_guard_code,
+            generate_totp_code=generate_totp_code,
+            set_funpay_order_context=set_funpay_order_context,
+            clear_funpay_order_context=clear_funpay_order_context,
+            mark_funpay_order_notification_for_busy_accounts=mark_funpay_order_notification_for_busy_accounts,
+            normalize_db_text=normalize_db_text,
+            is_funpay_order_closed=is_funpay_order_closed,
+            get_account_by_funpay_order_id=get_account_by_funpay_order_id,
+            get_account_by_id=get_account_by_id,
+            add_rent_history_entry=add_rent_history_entry,
+            close_open_rent_history=close_open_rent_history,
+        )
+    )
     asyncio.create_task(checker_loop())
+    asyncio.create_task(run_funpay_worker())
     print("Бот запущен")
     await dp.start_polling(bot, allowed_updates=["message"])
 
