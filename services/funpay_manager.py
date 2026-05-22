@@ -56,6 +56,8 @@ _FUNPAY_AUTO_RAISE_WARMUP_MAX_SECONDS = 1500
 _FUNPAY_AUTO_RAISE_MAX_CATEGORIES_PER_RUN = 3
 _FUNPAY_AUTO_RAISE_REQUEST_PAUSE_MIN_SECONDS = 2.0
 _FUNPAY_AUTO_RAISE_REQUEST_PAUSE_MAX_SECONDS = 6.0
+_FUNPAY_ORDER_CACHE: dict[str, tuple[float, dict]] = {}
+_FUNPAY_ORDER_CACHE_TTL_SECONDS = 180.0
 
 
 def configure(runtime: FunPayRuntime) -> None:
@@ -157,10 +159,58 @@ def get_funpay_auto_raise_enabled() -> bool:
 
 def _funpay_build_account_sync(golden_key: str, user_agent: str | None = None):
     funpay_ensure_available()
-    acc = FunPayAccount(golden_key, user_agent=user_agent or None)
+    return FunPayAccount(golden_key, user_agent=user_agent or None)
+
+
+def _funpay_build_loaded_account_sync(golden_key: str, user_agent: str | None = None):
+    acc = _funpay_build_account_sync(golden_key, user_agent)
     if hasattr(acc, "get"):
         acc.get()
     return acc
+
+
+def _funpay_is_rate_limit_error(exc: Exception) -> bool:
+    text = str(exc)
+    return "429" in text or "Too Many Requests" in text
+
+
+def _funpay_call_with_retry_sync(fn: Callable, *args, retries: int = 2, delay_seconds: float = 1.5, **kwargs):
+    last_error: Exception | None = None
+    attempt_total = max(1, int(retries))
+    for attempt in range(attempt_total):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_error = e
+            if not _funpay_is_rate_limit_error(e) or attempt >= attempt_total - 1:
+                raise
+            wait_seconds = delay_seconds * (attempt + 1)
+            logging.warning("FunPay rate limit detected, retrying in %.1fs: %s", wait_seconds, e)
+            time.sleep(wait_seconds)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("FunPay retry helper failed unexpectedly")
+
+
+def _funpay_cache_order(order_id: str, order_data: dict) -> None:
+    normalized_id = str(order_id or "").strip().upper()
+    if not normalized_id:
+        return
+    _FUNPAY_ORDER_CACHE[normalized_id] = (time.monotonic(), dict(order_data))
+
+
+def _funpay_get_cached_order(order_id: str) -> dict | None:
+    normalized_id = str(order_id or "").strip().upper()
+    if not normalized_id:
+        return None
+    cached = _FUNPAY_ORDER_CACHE.get(normalized_id)
+    if not cached:
+        return None
+    cached_at, payload = cached
+    if (time.monotonic() - cached_at) > _FUNPAY_ORDER_CACHE_TTL_SECONDS:
+        _FUNPAY_ORDER_CACHE.pop(normalized_id, None)
+        return None
+    return dict(payload)
 
 
 def _funpay_extract_chat_id(chat_obj: Any) -> int | str | None:
@@ -189,23 +239,40 @@ def _funpay_resolve_chat_by_buyer_name(acc, buyer_username: str | None) -> int |
     if method is None:
         return None
 
-    call_variants = [
-        (buyer_username, True),
-        (buyer_username, False),
-        (buyer_username,),
-    ]
-    for args in call_variants:
+    try:
+        chat_obj = method(buyer_username, True)
+    except TypeError:
         try:
-            chat_obj = method(*args)
-        except TypeError:
-            continue
+            chat_obj = method(buyer_username)
         except Exception as e:
             logging.error("FunPay chat resolve error by buyer name (%s): %s", buyer_username, e)
-            continue
-        chat_id = _funpay_extract_chat_id(chat_obj)
-        if chat_id is not None:
-            return chat_id
+            return None
+    except Exception as e:
+        logging.error("FunPay chat resolve error by buyer name (%s): %s", buyer_username, e)
+        return None
+    chat_id = _funpay_extract_chat_id(chat_obj)
+    if chat_id is not None:
+        return chat_id
     return None
+
+
+def _funpay_send_message_with_retry_sync(acc, chat_id: int | str, message_text: str, *, context: str) -> None:
+    attempts = 2
+    for attempt in range(attempts):
+        try:
+            acc.send_message(chat_id, message_text)
+            return
+        except Exception as e:
+            err_text = str(e)
+            if "NoneType" in err_text and "text" in err_text:
+                logging.warning("FunPay %s sent, but library raised harmless error: %s", context, err_text)
+                return
+            if _funpay_is_rate_limit_error(e) and attempt < attempts - 1:
+                wait_seconds = 2.0 + attempt * 2.0
+                logging.warning("FunPay rate limit detected while sending %s, retrying in %.1fs: %s", context, wait_seconds, err_text)
+                time.sleep(wait_seconds)
+                continue
+            raise
 
 
 def _funpay_collect_text_parts(obj, field_names: list[str]) -> list[str]:
@@ -261,10 +328,15 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
     if not golden_key:
         return {"error": "FunPay golden key не задан"}
 
-    acc = _funpay_build_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
     normalized_id = str(order_id or "").strip().upper()
     if not normalized_id:
         return {"error": "Пустой order_id"}
+
+    cached_order = _funpay_get_cached_order(normalized_id)
+    if cached_order is not None:
+        return cached_order
+
+    acc = _funpay_build_loaded_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
 
     available_methods = [name for name in ("getNewOrders", "getLastOrders", "getDialogs") if hasattr(acc, name)]
     direct_lookup_errors: list[str] = []
@@ -286,7 +358,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
                     chat_id = _funpay_resolve_chat_by_buyer_name(acc, buyer_username)
                 order_status = getattr(direct_order, "status", None) or getattr(direct_order, "state", None)
                 order_price = getattr(direct_order, "price", None) or getattr(direct_order, "sum", None)
-                return {
+                result = {
                     "id": normalized_id,
                     "description": description,
                     "buyer_username": buyer_username,
@@ -301,6 +373,8 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
                         "text_parts": text_parts[:10],
                     },
                 }
+                _funpay_cache_order(normalized_id, result)
+                return result
         except Exception as e:
             logging.error("FunPay direct order lookup error (%s): %s", method_name, e)
             direct_lookup_errors.append(f"{method_name}:{e}")
@@ -335,7 +409,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
             chat_id = _funpay_resolve_chat_by_buyer_name(acc, buyer_username)
         order_status = getattr(order, "status", None) or getattr(order, "state", None)
         order_price = getattr(order, "price", None) or getattr(order, "sum", None)
-        return {
+        result = {
             "id": current_id,
             "description": description,
             "buyer_username": buyer_username,
@@ -350,6 +424,8 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
                 "text_parts": text_parts[:10],
             },
         }
+        _funpay_cache_order(current_id, result)
+        return result
 
     dialog_candidates: list[object] = []
     try:
@@ -372,7 +448,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
         if dialog_user is None:
             dialog_user_obj = getattr(dialog, "user", None)
             dialog_user = getattr(dialog_user_obj, "name", None) or getattr(dialog_user_obj, "username", None)
-        return {
+        result = {
             "id": normalized_id,
             "description": dialog_text,
             "buyer_username": dialog_user,
@@ -387,6 +463,8 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
                 "text_parts": dialog_text_parts[:10],
             },
         }
+        _funpay_cache_order(normalized_id, result)
+        return result
 
     return {
         "id": normalized_id,
@@ -470,15 +548,9 @@ def _funpay_send_chat_message_sync(chat_id: int | str, message_text: str, user_a
 
     acc = _funpay_build_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
     try:
-        acc.send_message(chat_id, message_text)
+        _funpay_send_message_with_retry_sync(acc, chat_id, message_text, context="chat message")
     except Exception as e:
-        err_text = str(e)
-        if "429" in err_text or "Too Many Requests" in err_text:
-            logging.warning("FunPay rate limit detected while sending chat message: %s", err_text)
-        if "NoneType" in err_text and "text" in err_text:
-            logging.warning("FunPay chat message sent, but library raised harmless error: %s", err_text)
-        else:
-            raise
+        raise
 
 
 def _funpay_send_initial_order_message_sync(
@@ -563,15 +635,9 @@ def _funpay_send_initial_order_message_sync(
         order_copy_lines.extend([f"Faceit email: {faceit_email_display}", f"Faceit пароль: {faceit_password_display}"])
 
     try:
-        acc.send_message(chat_id, "\n".join(order_text_lines))
+        _funpay_send_message_with_retry_sync(acc, chat_id, "\n".join(order_text_lines), context="initial order message")
     except Exception as e:
-        err_text = str(e)
-        if "429" in err_text or "Too Many Requests" in err_text:
-            logging.warning("FunPay rate limit detected while sending initial order message: %s", err_text)
-        if "NoneType" in err_text and "text" in err_text:
-            logging.warning("FunPay initial order message sent, but library raised harmless error: %s", err_text)
-        else:
-            return {"error": f"Не удалось отправить данные в чат заказа: {e}"}
+        return {"error": f"Не удалось отправить данные в чат заказа: {e}"}
 
     return {
         "success": True,
@@ -666,15 +732,9 @@ def _funpay_send_code_to_order_sync(
         return {"error": "Неизвестный тип кода"}
 
     try:
-        acc.send_message(chat_id, message_text)
+        _funpay_send_message_with_retry_sync(acc, chat_id, message_text, context="order code")
     except Exception as e:
-        err_text = str(e)
-        if "429" in err_text or "Too Many Requests" in err_text:
-            logging.warning("FunPay rate limit detected while sending order code: %s", err_text)
-        if "NoneType" in err_text and "text" in err_text:
-            logging.warning("FunPay code sent, but library raised harmless error: %s", err_text)
-        else:
-            return {"error": f"Не удалось отправить код в чат заказа: {e}"}
+        return {"error": f"Не удалось отправить код в чат заказа: {e}"}
     return {"success": True, "chat_id": chat_id, "buyer_username": buyer_username, "code_type": code_type, "code": code}
 
 
