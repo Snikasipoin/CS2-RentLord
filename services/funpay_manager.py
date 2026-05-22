@@ -546,7 +546,7 @@ def _funpay_send_chat_message_sync(chat_id: int | str, message_text: str, user_a
     if not golden_key:
         raise RuntimeError("FunPay golden key не задан")
 
-    acc = _funpay_build_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
+    acc = _funpay_build_loaded_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
     try:
         _funpay_send_message_with_retry_sync(acc, chat_id, message_text, context="chat message")
     except Exception as e:
@@ -569,7 +569,7 @@ def _funpay_send_initial_order_message_sync(
     if not golden_key:
         return {"error": "FunPay golden key не задан"}
 
-    acc = _funpay_build_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
+    acc = _funpay_build_loaded_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
     order = _funpay_find_order_record_sync(order_id, user_agent)
     if order.get("error"):
         return order
@@ -666,7 +666,7 @@ def _funpay_send_code_to_order_sync(
     if not golden_key:
         return {"error": "FunPay golden key не задан"}
 
-    acc = _funpay_build_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
+    acc = _funpay_build_loaded_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
     order = _funpay_find_order_record_sync(order_id, user_agent)
     if order.get("error"):
         return order
