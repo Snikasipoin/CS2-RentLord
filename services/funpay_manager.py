@@ -8,6 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import wraps
 from typing import Any, Callable
 
 try:
@@ -58,6 +59,12 @@ _FUNPAY_AUTO_RAISE_REQUEST_PAUSE_MIN_SECONDS = 2.0
 _FUNPAY_AUTO_RAISE_REQUEST_PAUSE_MAX_SECONDS = 6.0
 _FUNPAY_ORDER_CACHE: dict[str, tuple[float, dict]] = {}
 _FUNPAY_ORDER_CACHE_TTL_SECONDS = 180.0
+_FUNPAY_ACCOUNT_CACHE: dict[tuple[str, str], tuple[float, Any]] = {}
+_FUNPAY_ACCOUNT_CACHE_TTL_SECONDS = 300.0
+_FUNPAY_ACCOUNT_CACHE_LOCK = threading.Lock()
+_FUNPAY_IO_LOCK = threading.RLock()
+_FUNPAY_LAST_SEND_TS = 0.0
+_FUNPAY_MIN_SEND_INTERVAL_SECONDS = 3.0
 
 
 def configure(runtime: FunPayRuntime) -> None:
@@ -69,6 +76,15 @@ def _ctx() -> FunPayRuntime:
     if _CTX is None:
         raise RuntimeError("FunPay runtime is not configured")
     return _CTX
+
+
+def _funpay_serialized_sync(fn: Callable) -> Callable:
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _FUNPAY_IO_LOCK:
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 def resolve_funpay_golden_key() -> str:
@@ -162,11 +178,26 @@ def _funpay_build_account_sync(golden_key: str, user_agent: str | None = None):
     return FunPayAccount(golden_key, user_agent=user_agent or None)
 
 
+@_funpay_serialized_sync
 def _funpay_build_loaded_account_sync(golden_key: str, user_agent: str | None = None):
-    acc = _funpay_build_account_sync(golden_key, user_agent)
-    if hasattr(acc, "get"):
-        acc.get()
-    return acc
+    with _FUNPAY_IO_LOCK:
+        cache_key = (str(golden_key or "").strip(), (user_agent or "").strip())
+        now_ts = time.monotonic()
+        with _FUNPAY_ACCOUNT_CACHE_LOCK:
+            cached = _FUNPAY_ACCOUNT_CACHE.get(cache_key)
+            if cached is not None:
+                cached_at, cached_acc = cached
+                if (now_ts - cached_at) <= _FUNPAY_ACCOUNT_CACHE_TTL_SECONDS:
+                    return cached_acc
+                _FUNPAY_ACCOUNT_CACHE.pop(cache_key, None)
+
+        acc = _funpay_build_account_sync(golden_key, user_agent)
+        if hasattr(acc, "get"):
+            _funpay_call_with_retry_sync(acc.get, retries=2, delay_seconds=2.0)
+
+        with _FUNPAY_ACCOUNT_CACHE_LOCK:
+            _FUNPAY_ACCOUNT_CACHE[cache_key] = (time.monotonic(), acc)
+        return acc
 
 
 def _funpay_is_rate_limit_error(exc: Exception) -> bool:
@@ -257,22 +288,33 @@ def _funpay_resolve_chat_by_buyer_name(acc, buyer_username: str | None) -> int |
 
 
 def _funpay_send_message_with_retry_sync(acc, chat_id: int | str, message_text: str, *, context: str) -> None:
-    attempts = 2
-    for attempt in range(attempts):
-        try:
-            acc.send_message(chat_id, message_text)
-            return
-        except Exception as e:
-            err_text = str(e)
-            if "NoneType" in err_text and "text" in err_text:
-                logging.warning("FunPay %s sent, but library raised harmless error: %s", context, err_text)
+    with _FUNPAY_IO_LOCK:
+        attempts = 2
+        for attempt in range(attempts):
+            try:
+                global _FUNPAY_LAST_SEND_TS
+                now_ts = time.monotonic()
+                min_gap = _FUNPAY_MIN_SEND_INTERVAL_SECONDS
+                if _FUNPAY_LAST_SEND_TS > 0:
+                    elapsed = now_ts - _FUNPAY_LAST_SEND_TS
+                    if elapsed < min_gap:
+                        sleep_for = min_gap - elapsed
+                        time.sleep(sleep_for)
+                acc.send_message(chat_id, message_text)
+                _FUNPAY_LAST_SEND_TS = time.monotonic()
                 return
-            if _funpay_is_rate_limit_error(e) and attempt < attempts - 1:
-                wait_seconds = 2.0 + attempt * 2.0
-                logging.warning("FunPay rate limit detected while sending %s, retrying in %.1fs: %s", context, wait_seconds, err_text)
-                time.sleep(wait_seconds)
-                continue
-            raise
+            except Exception as e:
+                err_text = str(e)
+                if "NoneType" in err_text and "text" in err_text:
+                    logging.warning("FunPay %s sent, but library raised harmless error: %s", context, err_text)
+                    _FUNPAY_LAST_SEND_TS = time.monotonic()
+                    return
+                if _funpay_is_rate_limit_error(e) and attempt < attempts - 1:
+                    wait_seconds = 5.0 + attempt * 3.0
+                    logging.warning("FunPay rate limit detected while sending %s, retrying in %.1fs: %s", context, wait_seconds, err_text)
+                    time.sleep(wait_seconds)
+                    continue
+                raise
 
 
 def _funpay_collect_text_parts(obj, field_names: list[str]) -> list[str]:
@@ -323,6 +365,7 @@ def normalize_funpay_order_fields(order_id: str | None, order_url: str | None) -
     return parsed_id, parsed_url
 
 
+@_funpay_serialized_sync
 def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None) -> dict:
     golden_key = resolve_funpay_golden_key()
     if not golden_key:
@@ -541,6 +584,7 @@ def _funpay_format_order_debug_text(
     return "FunPay debug:\n" + "\n".join(lines)
 
 
+@_funpay_serialized_sync
 def _funpay_send_chat_message_sync(chat_id: int | str, message_text: str, user_agent: str | None = None) -> None:
     golden_key = resolve_funpay_golden_key()
     if not golden_key:
@@ -553,6 +597,7 @@ def _funpay_send_chat_message_sync(chat_id: int | str, message_text: str, user_a
         raise
 
 
+@_funpay_serialized_sync
 def _funpay_send_initial_order_message_sync(
     order_id: str,
     steam_login: str,
@@ -651,6 +696,7 @@ def _funpay_send_initial_order_message_sync(
     }
 
 
+@_funpay_serialized_sync
 def _funpay_send_code_to_order_sync(
     order_id: str,
     code_type: str,
@@ -823,6 +869,7 @@ def _funpay_collect_balance_lot_candidates(acc, limit: int = 12) -> list[int]:
     return candidates
 
 
+@_funpay_serialized_sync
 def _funpay_fetch_balance_sync(golden_key: str, user_agent: str | None = None) -> dict:
     acc = _funpay_build_account_sync(golden_key, user_agent)
     fallback_used = False
@@ -865,6 +912,7 @@ def _funpay_fetch_balance_sync(golden_key: str, user_agent: str | None = None) -
     }
 
 
+@_funpay_serialized_sync
 def _funpay_raise_all_lots_sync(
     golden_key: str,
     user_agent: str | None = None,
