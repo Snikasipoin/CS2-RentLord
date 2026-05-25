@@ -2771,7 +2771,7 @@ async def _funpay_handle_chat_message(
 
     try:
         label = "Steam Guard" if code_type == "steam" else "Faceit"
-        await asyncio.to_thread(_funpay_send_chat_message_sync, chat_id, f"{label} код: {code}")
+        await funpay_send_chat_message(chat_id, f"{label} код: {code}")
         cursor.execute(
             "UPDATE accounts SET funpay_order_last_code_sent_at = ? WHERE id = ?",
             (datetime.now(timezone.utc).isoformat(), row[0]),
@@ -4175,8 +4175,7 @@ async def account_detail_action(message: types.Message, state: FSMContext):
             )
 
         try:
-            result = await asyncio.to_thread(
-                _funpay_send_code_to_order_sync,
+            result = await funpay_send_code_to_order(
                 order_id or "",
                 code_type,
                 row[0],
@@ -5497,8 +5496,7 @@ async def rent_enter_order(message: types.Message, state: FSMContext):
             faceit_email = f_email or None
             faceit_password = decrypt(f_pw_enc) if f_pw_enc else None
             try:
-                init_result = await asyncio.to_thread(
-                    _funpay_send_initial_order_message_sync,
+                init_result = await funpay_send_initial_order_message(
                     order_id,
                     s_login,
                     s_pw,
@@ -5771,8 +5769,7 @@ async def checker_loop():
                         conn.commit()
                         if funpay_chat_id:
                             try:
-                                await asyncio.to_thread(
-                                    _funpay_send_chat_message_sync,
+                                await funpay_send_chat_message(
                                     funpay_chat_id,
                                     "⚠️ До конца аренды осталось около 5 минут. Если планируете продолжать, пожалуйста, продлите аренду."
                                 )
@@ -5796,8 +5793,7 @@ async def checker_loop():
 
                             if funpay_chat_id:
                                 try:
-                                    await asyncio.to_thread(
-                                        _funpay_send_chat_message_sync,
+                                    await funpay_send_chat_message(
                                         funpay_chat_id,
                                         final_order_text,
                                     )
@@ -5876,11 +5872,15 @@ _BOT_GET_FUNPAY_OP_LOCK = get_funpay_op_lock
 from services.funpay_manager import (
     FunPayRuntime,
     configure as configure_funpay_manager,
+    run_funpay_io_worker,
     run_funpay_worker,
     funpay_get_balance,
     funpay_raise_all_lots,
     funpay_toggle_auto_raise,
     get_funpay_next_auto_raise_in,
+    funpay_send_chat_message,
+    funpay_send_initial_order_message,
+    funpay_send_code_to_order,
     resolve_funpay_golden_key,
     resolve_funpay_user_agent,
     _funpay_build_account_sync,
@@ -5936,6 +5936,7 @@ async def main():
         )
     )
     asyncio.create_task(checker_loop())
+    asyncio.create_task(run_funpay_io_worker())
     asyncio.create_task(run_funpay_worker())
     print("Бот запущен")
     await dp.start_polling(bot, allowed_updates=["message"])

@@ -42,9 +42,20 @@ class FunPayRuntime:
     close_open_rent_history: Callable[..., None]
 
 
+@dataclass
+class FunPayJob:
+    label: str
+    sync_fn: Callable
+    args: tuple[Any, ...]
+    kwargs: dict[str, Any]
+    future: asyncio.Future
+
+
 _CTX: FunPayRuntime | None = None
 _FUNPAY_LISTENER_THREAD_STARTED = False
 _FUNPAY_LISTENER_THREAD: threading.Thread | None = None
+_FUNPAY_IO_QUEUE: asyncio.Queue[FunPayJob] | None = None
+_FUNPAY_IO_WORKER_STARTED = False
 _FUNPAY_AUTO_RAISE_LAST_RUN = 0.0
 _FUNPAY_AUTO_RAISE_NEXT_RUN_TS = 0.0
 _FUNPAY_AUTO_RAISE_ROTATION_OFFSET = 0
@@ -85,6 +96,29 @@ def _funpay_serialized_sync(fn: Callable) -> Callable:
             return fn(*args, **kwargs)
 
     return wrapper
+
+
+def _funpay_get_io_queue() -> asyncio.Queue[FunPayJob]:
+    global _FUNPAY_IO_QUEUE
+    if _FUNPAY_IO_QUEUE is None:
+        _FUNPAY_IO_QUEUE = asyncio.Queue()
+    return _FUNPAY_IO_QUEUE
+
+
+async def _funpay_submit_io_job(label: str, sync_fn: Callable, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    queue = _funpay_get_io_queue()
+    await queue.put(
+        FunPayJob(
+            label=label,
+            sync_fn=sync_fn,
+            args=tuple(args),
+            kwargs=dict(kwargs),
+            future=future,
+        )
+    )
+    return await future
 
 
 def resolve_funpay_golden_key() -> str:
@@ -984,11 +1018,10 @@ async def funpay_get_balance() -> dict:
         return {"error": "FunPay golden key не задан"}
 
     user_agent = resolve_funpay_user_agent()
-    async with get_funpay_op_lock():
-        try:
-            return await asyncio.to_thread(_funpay_fetch_balance_sync, golden_key, user_agent)
-        except Exception as e:
-            return {"error": str(e)}
+    try:
+        return await _funpay_submit_io_job("funpay_get_balance", _funpay_fetch_balance_sync, golden_key, user_agent)
+    except Exception as e:
+        return {"error": str(e)}
 
 
 async def funpay_raise_all_lots() -> dict:
@@ -998,26 +1031,26 @@ async def funpay_raise_all_lots() -> dict:
         return {"error": "FunPay golden key не задан"}
 
     user_agent = resolve_funpay_user_agent()
-    async with get_funpay_op_lock():
-        try:
-            result = await asyncio.to_thread(
-                _funpay_raise_all_lots_sync,
-                golden_key,
-                user_agent,
-                _FUNPAY_AUTO_RAISE_MAX_CATEGORIES_PER_RUN,
-                _FUNPAY_AUTO_RAISE_ROTATION_OFFSET,
-                _FUNPAY_AUTO_RAISE_REQUEST_PAUSE_MIN_SECONDS,
-                _FUNPAY_AUTO_RAISE_REQUEST_PAUSE_MAX_SECONDS,
-            )
-            total_categories = int(result.get("total_categories") or 0)
-            selected_categories = int(result.get("selected_categories") or 0)
-            if total_categories > 0 and selected_categories > 0:
-                _FUNPAY_AUTO_RAISE_ROTATION_OFFSET = (
-                    _FUNPAY_AUTO_RAISE_ROTATION_OFFSET + selected_categories
-                ) % total_categories
-            return result
-        except Exception as e:
-            return {"error": str(e)}
+    try:
+        result = await _funpay_submit_io_job(
+            "funpay_raise_all_lots",
+            _funpay_raise_all_lots_sync,
+            golden_key,
+            user_agent,
+            _FUNPAY_AUTO_RAISE_MAX_CATEGORIES_PER_RUN,
+            _FUNPAY_AUTO_RAISE_ROTATION_OFFSET,
+            _FUNPAY_AUTO_RAISE_REQUEST_PAUSE_MIN_SECONDS,
+            _FUNPAY_AUTO_RAISE_REQUEST_PAUSE_MAX_SECONDS,
+        )
+        total_categories = int(result.get("total_categories") or 0)
+        selected_categories = int(result.get("selected_categories") or 0)
+        if total_categories > 0 and selected_categories > 0:
+            _FUNPAY_AUTO_RAISE_ROTATION_OFFSET = (
+                _FUNPAY_AUTO_RAISE_ROTATION_OFFSET + selected_categories
+            ) % total_categories
+        return result
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def _funpay_register_new_order(loop: asyncio.AbstractEventLoop, order_id: str, order_url: str | None, buyer_username: str | None, chat_id: int | str | None, status: str | None, price: str | None) -> None:
@@ -1089,7 +1122,7 @@ async def _funpay_handle_chat_message(chat_id: int | None, author_id: int | None
         return
     try:
         label = "Steam Guard" if code_type == "steam" else "Faceit"
-        await asyncio.to_thread(_funpay_send_chat_message_sync, chat_id, f"{label} код: {code}")
+        await funpay_send_chat_message(chat_id, f"{label} код: {code}")
         cursor.execute(
             "UPDATE accounts SET funpay_order_last_code_sent_at = ? WHERE id = ?",
             (datetime.now(timezone.utc).isoformat(), row[0]),
@@ -1097,6 +1130,100 @@ async def _funpay_handle_chat_message(chat_id: int | None, author_id: int | None
         _ctx().conn.commit()
     except Exception as e:
         logging.error("funpay code send error: %s", e)
+
+
+async def funpay_send_chat_message(chat_id: int | str, message_text: str, user_agent: str | None = None) -> None:
+    golden_key = resolve_funpay_golden_key()
+    if not golden_key:
+        raise RuntimeError("FunPay golden key не задан")
+    await _funpay_submit_io_job("funpay_send_chat_message", _funpay_send_chat_message_sync, chat_id, message_text, user_agent)
+
+
+async def funpay_send_initial_order_message(
+    order_id: str,
+    steam_login: str,
+    steam_password: str,
+    faceit_email: str | None = None,
+    faceit_password: str | None = None,
+    include_faceit: bool = True,
+    persist_account_id: int | None = None,
+    fallback_chat_id: int | str | None = None,
+    fallback_buyer_username: str | None = None,
+    user_agent: str | None = None,
+) -> dict:
+    golden_key = resolve_funpay_golden_key()
+    if not golden_key:
+        return {"error": "FunPay golden key не задан"}
+    return await _funpay_submit_io_job(
+        "funpay_send_initial_order_message",
+        _funpay_send_initial_order_message_sync,
+        order_id,
+        steam_login,
+        steam_password,
+        faceit_email,
+        faceit_password,
+        include_faceit,
+        persist_account_id,
+        fallback_chat_id,
+        fallback_buyer_username,
+        user_agent,
+    )
+
+
+async def funpay_send_code_to_order(
+    order_id: str,
+    code_type: str,
+    account_login: str | None = None,
+    steam_shared_secret: str | None = None,
+    faceit_2fa_secret: str | None = None,
+    persist_account_id: int | None = None,
+    fallback_chat_id: int | str | None = None,
+    fallback_buyer_username: str | None = None,
+    user_agent: str | None = None,
+) -> dict:
+    golden_key = resolve_funpay_golden_key()
+    if not golden_key:
+        return {"error": "FunPay golden key не задан"}
+    return await _funpay_submit_io_job(
+        "funpay_send_code_to_order",
+        _funpay_send_code_to_order_sync,
+        order_id,
+        code_type,
+        account_login,
+        steam_shared_secret,
+        faceit_2fa_secret,
+        persist_account_id,
+        fallback_chat_id,
+        fallback_buyer_username,
+        user_agent,
+    )
+
+
+async def run_funpay_io_worker() -> None:
+    global _FUNPAY_IO_WORKER_STARTED
+    if _FUNPAY_IO_WORKER_STARTED:
+        return
+    _FUNPAY_IO_WORKER_STARTED = True
+    queue = _funpay_get_io_queue()
+    logging.info("FunPay IO worker started")
+    while True:
+        job = await queue.get()
+        try:
+            logging.info("FunPay job started: %s", job.label)
+            try:
+                result = await asyncio.to_thread(job.sync_fn, *job.args, **job.kwargs)
+                if not job.future.cancelled():
+                    job.future.set_result(result)
+                logging.info("FunPay job finished: %s", job.label)
+                await asyncio.sleep(5)
+            except Exception as e:
+                if not job.future.cancelled():
+                    job.future.set_exception(e)
+                logging.error("FunPay job failed: %s: %s", job.label, e)
+        except Exception as e:
+            logging.exception("FunPay IO worker loop error: %s", e)
+        finally:
+            queue.task_done()
 
 
 def _funpay_listener_thread(loop: asyncio.AbstractEventLoop) -> None:
