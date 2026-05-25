@@ -361,7 +361,84 @@ def get_funpay_op_lock() -> asyncio.Lock:
 #  База данных
 # ────────────────────────────────────────────────
 
-conn = sqlite3.connect("accounts.db", check_same_thread=False)
+class LockedSQLiteCursor:
+    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock, cursor: sqlite3.Cursor | None = None):
+        self._conn = conn
+        self._lock = lock
+        self._local = threading.local()
+        if cursor is not None:
+            self._local.cursor = cursor
+
+    def _get_cursor(self):
+        cursor_obj = getattr(self._local, "cursor", None)
+        if cursor_obj is None:
+            cursor_obj = self._conn.cursor()
+            self._local.cursor = cursor_obj
+        return cursor_obj
+
+    def execute(self, *args, **kwargs):
+        with self._lock:
+            cursor_obj = self._conn.cursor()
+            self._local.cursor = cursor_obj
+            cursor_obj.execute(*args, **kwargs)
+            return self
+
+    def executemany(self, *args, **kwargs):
+        with self._lock:
+            cursor_obj = self._conn.cursor()
+            self._local.cursor = cursor_obj
+            cursor_obj.executemany(*args, **kwargs)
+            return self
+
+    def fetchone(self):
+        with self._lock:
+            return self._get_cursor().fetchone()
+
+    def fetchall(self):
+        with self._lock:
+            return self._get_cursor().fetchall()
+
+    @property
+    def rowcount(self):
+        return self._get_cursor().rowcount
+
+    @property
+    def lastrowid(self):
+        return self._get_cursor().lastrowid
+
+    def __getattr__(self, name):
+        return getattr(self._get_cursor(), name)
+
+
+class LockedSQLiteConnection:
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+        self._lock = threading.RLock()
+
+    def cursor(self):
+        with self._lock:
+            return LockedSQLiteCursor(self._conn, self._lock)
+
+    def execute(self, *args, **kwargs):
+        return self.cursor().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return self.cursor().executemany(*args, **kwargs)
+
+    def commit(self):
+        with self._lock:
+            return self._conn.commit()
+
+    def rollback(self):
+        with self._lock:
+            return self._conn.rollback()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+_raw_conn = sqlite3.connect("accounts.db", check_same_thread=False)
+conn = LockedSQLiteConnection(_raw_conn)
 cursor = conn.cursor()
 DB_MAINTENANCE = False
 FUNPAY_OP_LOCK: asyncio.Lock | None = None

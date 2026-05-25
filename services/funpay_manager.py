@@ -1236,13 +1236,7 @@ def _funpay_listener_thread(loop: asyncio.AbstractEventLoop) -> None:
         logging.warning("FunPay golden key not set; FunPay listener disabled")
         return
     try:
-        acc = _funpay_build_account_sync(golden_key, resolve_funpay_user_agent())
-        if hasattr(acc, "get"):
-            try:
-                acc.get()
-            except Exception as e:
-                logging.error("FunPay account init error: %s", e)
-                return
+        acc = _funpay_build_loaded_account_sync(golden_key, resolve_funpay_user_agent())
         runner = FunPayRunner(acc)
     except Exception as e:
         logging.error("FunPay listener init error: %s", e)
