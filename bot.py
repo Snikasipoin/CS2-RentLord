@@ -415,6 +415,9 @@ class LockedSQLiteConnection:
         self._conn = conn
         self._lock = threading.RLock()
 
+    def _unwrap_conn(self, other):
+        return getattr(other, "_conn", other)
+
     def cursor(self):
         with self._lock:
             return LockedSQLiteCursor(self._conn, self._lock)
@@ -432,6 +435,10 @@ class LockedSQLiteConnection:
     def rollback(self):
         with self._lock:
             return self._conn.rollback()
+
+    def backup(self, target, *args, **kwargs):
+        with self._lock:
+            return self._conn.backup(self._unwrap_conn(target), *args, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._conn, name)
@@ -3830,10 +3837,10 @@ def parse_block_duration(text: str) -> timedelta | None:
 
 
 def write_database_backup(backup_path: str) -> None:
-    conn.commit()
+    _raw_conn.commit()
     dest = sqlite3.connect(backup_path)
     try:
-        conn.backup(dest)
+        _raw_conn.backup(dest)
         dest.commit()
     finally:
         dest.close()
@@ -3851,11 +3858,11 @@ def validate_backup_file(backup_path: str) -> None:
 
 
 def restore_database_from_file(backup_path: str) -> None:
-    conn.commit()
+    _raw_conn.commit()
     src = sqlite3.connect(backup_path)
     try:
-        src.backup(conn)
-        conn.commit()
+        src.backup(_raw_conn)
+        _raw_conn.commit()
     finally:
         src.close()
 
