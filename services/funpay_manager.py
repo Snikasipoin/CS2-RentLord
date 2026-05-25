@@ -388,7 +388,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
         if method is None:
             continue
         try:
-            direct_order = method(normalized_id)
+            direct_order = _funpay_call_with_retry_sync(method, normalized_id, retries=2, delay_seconds=5.0)
             if direct_order:
                 text_parts = _funpay_collect_text_parts(direct_order, ["description", "title", "name", "subject", "label", "text"])
                 description = " | ".join(text_parts)
@@ -430,7 +430,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
         if getter is None:
             continue
         try:
-            items = getter() or []
+            items = _funpay_call_with_retry_sync(getter, retries=2, delay_seconds=5.0) or []
             candidates.extend(items)
             lookup_sources.append(f"{getter_name}:{len(items)}")
         except Exception as e:
@@ -474,7 +474,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
     try:
         dialogs = getattr(acc, "getDialogs", None)
         if dialogs is not None:
-            items = dialogs() or []
+            items = _funpay_call_with_retry_sync(dialogs, retries=2, delay_seconds=5.0) or []
             dialog_candidates.extend(items)
             lookup_sources.append(f"getDialogs:{len(items)}")
     except Exception as e:
