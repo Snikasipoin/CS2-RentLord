@@ -955,7 +955,7 @@ def _funpay_raise_all_lots_sync(
     pause_min_seconds: float = 0.0,
     pause_max_seconds: float = 0.0,
 ) -> dict:
-    acc = _funpay_build_account_sync(golden_key, user_agent)
+    acc = _funpay_build_loaded_account_sync(golden_key, user_agent)
     categories = acc.get_sorted_categories() or {}
     category_items = list(categories.items())
     total_categories = len(category_items)
