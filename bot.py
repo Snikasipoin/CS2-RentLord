@@ -3407,6 +3407,77 @@ def rent_package_label(package: str) -> str:
     return "Steam + Faceit" if package == "steam_faceit" else "Steam only"
 
 
+ACCOUNT_LIST_FILTER_LABELS = {
+    "all": "📋 Все",
+    "free": "🟢 Свободные",
+    "free_faceit": "🟢 Faceit+Steam",
+    "free_steam": "⚪ Только Steam",
+    "busy": "🔴 В аренде",
+    "blocked": "🔒 Блоки",
+    "funpay": "🎯 FunPay",
+}
+
+ACCOUNT_LIST_FILTER_TEXT_TO_KEY = {
+    label.lower(): key for key, label in ACCOUNT_LIST_FILTER_LABELS.items()
+}
+
+
+def normalize_account_list_filter(filter_key: str | None) -> str:
+    if not filter_key:
+        return "all"
+    key = str(filter_key).strip().lower()
+    return key if key in ACCOUNT_LIST_FILTER_LABELS else "all"
+
+
+def account_list_filter_label(filter_key: str | None) -> str:
+    return ACCOUNT_LIST_FILTER_LABELS.get(normalize_account_list_filter(filter_key), "📋 Все")
+
+
+def account_matches_list_filter(row_data: dict, rent_package: str | None, filter_key: str) -> bool:
+    status = (row_data.get("status") or "").strip().lower()
+    faceit_blocked = bool(row_data.get("faceit_blocked"))
+    steam_blocked = bool(row_data.get("steam_blocked"))
+    funpay_order_id = row_data.get("funpay_order_id")
+
+    if filter_key == "all":
+        return True
+    if filter_key == "free":
+        return status == "free"
+    if filter_key == "free_faceit":
+        return status == "free" and rent_package == "steam_faceit"
+    if filter_key == "free_steam":
+        return status == "free" and rent_package == "steam"
+    if filter_key == "busy":
+        return status == "busy"
+    if filter_key == "blocked":
+        return faceit_blocked or steam_blocked
+    if filter_key == "funpay":
+        return bool(funpay_order_id)
+    return True
+
+
+def build_accounts_list_kb(rows_data: list[dict]) -> ReplyKeyboardMarkup:
+    filter_rows = [
+        [
+            KeyboardButton(text="📋 Все"),
+            KeyboardButton(text="🟢 Свободные"),
+            KeyboardButton(text="🟢 Faceit+Steam"),
+        ],
+        [
+            KeyboardButton(text="⚪ Только Steam"),
+            KeyboardButton(text="🔴 В аренде"),
+            KeyboardButton(text="🔒 Блоки"),
+        ],
+        [KeyboardButton(text="🎯 FunPay")],
+    ]
+    account_rows = [[KeyboardButton(text=acc["login"])] for acc in rows_data]
+    account_rows.append([KeyboardButton(text="Отмена")])
+    return ReplyKeyboardMarkup(
+        keyboard=filter_rows + account_rows,
+        resize_keyboard=True,
+    )
+
+
 async def build_account_details_text(row) -> str:
     s_login, s_pw_enc, email, e_pw_enc, f_url, f_email, f_pw_enc, st, rent_end, *rest = row
     s_pw = decrypt(s_pw_enc)
@@ -4064,14 +4135,16 @@ async def show_accounts(message: types.Message, state: FSMContext):
     clean_expired_faceit_blocks()
     clean_expired_steam_blocks()
 
-    await render_accounts_list(message, state)
+    await render_accounts_list(message, state, "all")
 
 
-async def render_accounts_list(message: types.Message, state: FSMContext):
+async def render_accounts_list(message: types.Message, state: FSMContext, filter_key: str = "all"):
+    filter_key = normalize_account_list_filter(filter_key)
     await state.clear()
     cursor.execute(
         """
         SELECT id, steam_login, status, rent_end,
+               faceit_url, faceit_email, faceit_password,
                faceit_blocked, faceit_block_ends_at,
                steam_blocked, steam_block_ends_at,
                steam_presence_state, steam_presence_game,
@@ -4087,12 +4160,42 @@ async def render_accounts_list(message: types.Message, state: FSMContext):
 
     lines = []
     rows_data = []
-    for aid, login, st, end, faceit_blocked, faceit_block_end, steam_blocked, steam_block_end, steam_presence_state, steam_presence_game, funpay_order_id, funpay_order_status in rows:
-        rows_data.append({
+    total_count = len(rows)
+    for (
+        aid,
+        login,
+        st,
+        end,
+        faceit_url,
+        faceit_email,
+        faceit_password,
+        faceit_blocked,
+        faceit_block_end,
+        steam_blocked,
+        steam_block_end,
+        steam_presence_state,
+        steam_presence_game,
+        funpay_order_id,
+        funpay_order_status,
+    ) in rows:
+        package = None
+        if (st or "").strip().lower() == "free":
+            package = determine_rent_package(
+                faceit_url,
+                faceit_email,
+                faceit_password,
+                bool(faceit_blocked),
+                bool(steam_blocked),
+            )
+
+        row_data = {
             "id": aid,
             "login": login,
             "status": st,
             "end": end,
+            "faceit_url": faceit_url,
+            "faceit_email": faceit_email,
+            "faceit_password": faceit_password,
             "faceit_blocked": faceit_blocked,
             "faceit_block_end": faceit_block_end,
             "steam_blocked": steam_blocked,
@@ -4101,13 +4204,21 @@ async def render_accounts_list(message: types.Message, state: FSMContext):
             "steam_presence_game": steam_presence_game,
             "funpay_order_id": funpay_order_id,
             "funpay_order_status": funpay_order_status,
-        })
+            "rent_package": package,
+        }
+
+        if not account_matches_list_filter(row_data, package, filter_key):
+            continue
+
+        rows_data.append(row_data)
 
         has_blocks = bool(faceit_blocked) or bool(steam_blocked)
         prefix = "🔴" if st == "busy" else ("🔒" if has_blocks else "🟢")
         parts = [f"{prefix} {login}"]
 
-        if st == "busy" and end:
+        if st == "free":
+            parts.append(rent_package_label(package) if package else "не сдаётся")
+        elif st == "busy" and end:
             try:
                 dt = datetime.fromisoformat(end)
                 mins = max(0, int((dt - datetime.now()).total_seconds() / 60))
@@ -4135,14 +4246,29 @@ async def render_accounts_list(message: types.Message, state: FSMContext):
 
         lines.append(" | ".join(parts))
 
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=acc["login"])] for acc in rows_data] + [[KeyboardButton(text="Отмена")]],
-        resize_keyboard=True
-    )
+    kb = build_accounts_list_kb(rows_data)
     await state.set_state(AccountDetails.select_account)
-    await state.update_data(accounts=rows_data)
+    await state.update_data(accounts=rows_data, account_filter=filter_key)
+
+    if not rows_data:
+        filter_label = account_list_filter_label(filter_key)
+        await message.answer(
+            f"📦 Аккаунты\n"
+            f"Фильтр: {filter_label}\n"
+            f"Показано: 0 из {total_count}\n\n"
+            f"По выбранному фильтру аккаунтов нет.",
+            reply_markup=kb,
+        )
+        return
+
     await message.answer(
-        (("\n".join(lines) or "Пусто") + "\n\nВыберите аккаунт для просмотра данных:"),
+        (
+            f"📦 Аккаунты\n"
+            f"Фильтр: {account_list_filter_label(filter_key)}\n"
+            f"Показано: {len(rows_data)} из {total_count}\n\n"
+            + ("\n".join(lines) or "Пусто")
+            + "\n\nВыберите фильтр или аккаунт для просмотра данных:"
+        ),
         reply_markup=kb,
     )
 
@@ -4152,6 +4278,14 @@ async def show_account_details(message: types.Message, state: FSMContext):
     login = (message.text or "").strip()
     data = await state.get_data()
     rows = data.get("accounts", [])
+
+    if login.lower() in ACCOUNT_LIST_FILTER_TEXT_TO_KEY:
+        await render_accounts_list(message, state, ACCOUNT_LIST_FILTER_TEXT_TO_KEY[login.lower()])
+        return
+
+    if login.lower() in {"отмена", "назад"}:
+        await state.clear()
+        return await message.answer("Возврат в меню.", reply_markup=main_menu)
 
     chosen = next((r for r in rows if r.get("login") == login), None)
     if chosen is None:
@@ -4181,7 +4315,7 @@ async def account_detail_action(message: types.Message, state: FSMContext):
 
     if txt == "назад":
         await state.clear()
-        return await render_accounts_list(message, state)
+        return await render_accounts_list(message, state, data.get("account_filter", "all"))
 
     if txt == "трейд":
         return await message.answer(
