@@ -905,7 +905,7 @@ def _funpay_collect_balance_lot_candidates(acc, limit: int = 12) -> list[int]:
 
 @_funpay_serialized_sync
 def _funpay_fetch_balance_sync(golden_key: str, user_agent: str | None = None) -> dict:
-    acc = _funpay_build_account_sync(golden_key, user_agent)
+    acc = _funpay_build_loaded_account_sync(golden_key, user_agent)
     fallback_used = False
     fallback_lot_id = None
 
