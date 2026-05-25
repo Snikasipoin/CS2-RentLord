@@ -58,6 +58,7 @@ _FUNPAY_IO_QUEUE: asyncio.Queue[FunPayJob] | None = None
 _FUNPAY_IO_WORKER_STARTED = False
 _FUNPAY_AUTO_RAISE_LAST_RUN = 0.0
 _FUNPAY_AUTO_RAISE_NEXT_RUN_TS = 0.0
+_FUNPAY_SESSION_REFRESH_NEXT_RUN_TS = 0.0
 _FUNPAY_AUTO_RAISE_ROTATION_OFFSET = 0
 _FUNPAY_AUTO_RAISE_INTERVAL_SECONDS = 3600
 _FUNPAY_AUTO_RAISE_JITTER_SECONDS = 900
@@ -65,17 +66,24 @@ _FUNPAY_AUTO_RAISE_ERROR_BACKOFF_MIN_SECONDS = 1200
 _FUNPAY_AUTO_RAISE_ERROR_BACKOFF_MAX_SECONDS = 2700
 _FUNPAY_AUTO_RAISE_WARMUP_MIN_SECONDS = 480
 _FUNPAY_AUTO_RAISE_WARMUP_MAX_SECONDS = 1500
+_FUNPAY_SESSION_REFRESH_INTERVAL_SECONDS = 3600
+_FUNPAY_SESSION_REFRESH_JITTER_SECONDS = 300
+_FUNPAY_SESSION_REFRESH_ERROR_BACKOFF_MIN_SECONDS = 900
+_FUNPAY_SESSION_REFRESH_ERROR_BACKOFF_MAX_SECONDS = 1800
 _FUNPAY_AUTO_RAISE_MAX_CATEGORIES_PER_RUN = 3
 _FUNPAY_AUTO_RAISE_REQUEST_PAUSE_MIN_SECONDS = 2.0
 _FUNPAY_AUTO_RAISE_REQUEST_PAUSE_MAX_SECONDS = 6.0
 _FUNPAY_ORDER_CACHE: dict[str, tuple[float, dict]] = {}
 _FUNPAY_ORDER_CACHE_TTL_SECONDS = 180.0
 _FUNPAY_ACCOUNT_CACHE: dict[tuple[str, str], tuple[float, Any]] = {}
-_FUNPAY_ACCOUNT_CACHE_TTL_SECONDS = 300.0
+_FUNPAY_ACCOUNT_CACHE_TTL_SECONDS = 3600.0
 _FUNPAY_ACCOUNT_CACHE_LOCK = threading.Lock()
 _FUNPAY_IO_LOCK = threading.RLock()
 _FUNPAY_LAST_SEND_TS = 0.0
 _FUNPAY_MIN_SEND_INTERVAL_SECONDS = 3.0
+_FUNPAY_GLOBAL_COOLDOWN_UNTIL_TS = 0.0
+_FUNPAY_GLOBAL_COOLDOWN_REASON = ""
+_FUNPAY_LISTENER_REQUESTS_DELAY_SECONDS = 8
 
 
 def configure(runtime: FunPayRuntime) -> None:
@@ -170,6 +178,60 @@ def _clear_funpay_auto_raise_schedule() -> None:
     _FUNPAY_AUTO_RAISE_ROTATION_OFFSET = 0
 
 
+def _schedule_next_funpay_session_refresh(now_ts: float, mode: str = "normal") -> int:
+    global _FUNPAY_SESSION_REFRESH_NEXT_RUN_TS
+
+    if mode == "warmup":
+        delay = random.randint(
+            max(120, _FUNPAY_SESSION_REFRESH_INTERVAL_SECONDS // 6),
+            max(180, _FUNPAY_SESSION_REFRESH_INTERVAL_SECONDS // 2),
+        )
+    elif mode == "error":
+        delay = random.randint(
+            _FUNPAY_SESSION_REFRESH_ERROR_BACKOFF_MIN_SECONDS,
+            _FUNPAY_SESSION_REFRESH_ERROR_BACKOFF_MAX_SECONDS,
+        )
+    else:
+        raw_delay = _FUNPAY_SESSION_REFRESH_INTERVAL_SECONDS + random.randint(
+            -_FUNPAY_SESSION_REFRESH_JITTER_SECONDS,
+            _FUNPAY_SESSION_REFRESH_JITTER_SECONDS,
+        )
+        delay = max(1800, raw_delay)
+
+    _FUNPAY_SESSION_REFRESH_NEXT_RUN_TS = now_ts + delay
+    return delay
+
+
+def _clear_funpay_session_refresh_schedule() -> None:
+    global _FUNPAY_SESSION_REFRESH_NEXT_RUN_TS
+    _FUNPAY_SESSION_REFRESH_NEXT_RUN_TS = 0.0
+
+
+def _funpay_set_global_cooldown(seconds: float, reason: str) -> None:
+    global _FUNPAY_GLOBAL_COOLDOWN_UNTIL_TS, _FUNPAY_GLOBAL_COOLDOWN_REASON
+    now_ts = time.monotonic()
+    cooldown_seconds = max(0.0, float(seconds))
+    target_ts = now_ts + cooldown_seconds
+    if target_ts <= _FUNPAY_GLOBAL_COOLDOWN_UNTIL_TS:
+        return
+    _FUNPAY_GLOBAL_COOLDOWN_UNTIL_TS = target_ts
+    _FUNPAY_GLOBAL_COOLDOWN_REASON = reason
+    logging.warning("FunPay global cooldown set for %.1fs (%s)", cooldown_seconds, reason)
+
+
+def _funpay_wait_for_global_cooldown_sync(context: str) -> None:
+    remaining = _FUNPAY_GLOBAL_COOLDOWN_UNTIL_TS - time.monotonic()
+    if remaining <= 0:
+        return
+    logging.info(
+        "FunPay global cooldown active before %s (%s), sleeping %.1fs",
+        context,
+        _FUNPAY_GLOBAL_COOLDOWN_REASON or "unknown",
+        remaining,
+    )
+    time.sleep(remaining)
+
+
 def funpay_toggle_auto_raise() -> bool:
     global _FUNPAY_AUTO_RAISE_LAST_RUN
     cursor = _ctx().conn.cursor()
@@ -213,16 +275,18 @@ def _funpay_build_account_sync(golden_key: str, user_agent: str | None = None):
 
 
 @_funpay_serialized_sync
-def _funpay_build_loaded_account_sync(golden_key: str, user_agent: str | None = None):
+def _funpay_build_loaded_account_sync(golden_key: str, user_agent: str | None = None, force_refresh: bool = False):
     with _FUNPAY_IO_LOCK:
         cache_key = (str(golden_key or "").strip(), (user_agent or "").strip())
         now_ts = time.monotonic()
         with _FUNPAY_ACCOUNT_CACHE_LOCK:
             cached = _FUNPAY_ACCOUNT_CACHE.get(cache_key)
-            if cached is not None:
+            if cached is not None and not force_refresh:
                 cached_at, cached_acc = cached
                 if (now_ts - cached_at) <= _FUNPAY_ACCOUNT_CACHE_TTL_SECONDS:
                     return cached_acc
+                _FUNPAY_ACCOUNT_CACHE.pop(cache_key, None)
+            elif force_refresh:
                 _FUNPAY_ACCOUNT_CACHE.pop(cache_key, None)
 
         acc = _funpay_build_account_sync(golden_key, user_agent)
@@ -244,13 +308,18 @@ def _funpay_call_with_retry_sync(fn: Callable, *args, retries: int = 2, delay_se
     attempt_total = max(1, int(retries))
     for attempt in range(attempt_total):
         try:
+            _funpay_wait_for_global_cooldown_sync(getattr(fn, "__name__", "funpay_call"))
             return fn(*args, **kwargs)
         except Exception as e:
             last_error = e
             if not _funpay_is_rate_limit_error(e) or attempt >= attempt_total - 1:
+                if _funpay_is_rate_limit_error(e):
+                    cooldown_seconds = max(45.0, delay_seconds * (attempt + 1) * 4.0) + random.uniform(5.0, 20.0)
+                    _funpay_set_global_cooldown(cooldown_seconds, f"rate_limit:{getattr(fn, '__name__', 'funpay_call')}")
                 raise
             wait_seconds = delay_seconds * (attempt + 1)
             logging.warning("FunPay rate limit detected, retrying in %.1fs: %s", wait_seconds, e)
+            _funpay_set_global_cooldown(wait_seconds + random.uniform(5.0, 15.0), f"retry:{getattr(fn, '__name__', 'funpay_call')}")
             time.sleep(wait_seconds)
     if last_error is not None:
         raise last_error
@@ -326,6 +395,7 @@ def _funpay_send_message_with_retry_sync(acc, chat_id: int | str, message_text: 
         attempts = 2
         for attempt in range(attempts):
             try:
+                _funpay_wait_for_global_cooldown_sync(f"send:{context}")
                 global _FUNPAY_LAST_SEND_TS
                 now_ts = time.monotonic()
                 min_gap = _FUNPAY_MIN_SEND_INTERVAL_SECONDS
@@ -346,8 +416,11 @@ def _funpay_send_message_with_retry_sync(acc, chat_id: int | str, message_text: 
                 if _funpay_is_rate_limit_error(e) and attempt < attempts - 1:
                     wait_seconds = 5.0 + attempt * 3.0
                     logging.warning("FunPay rate limit detected while sending %s, retrying in %.1fs: %s", context, wait_seconds, err_text)
+                    _funpay_set_global_cooldown(wait_seconds + random.uniform(10.0, 20.0), f"send:{context}")
                     time.sleep(wait_seconds)
                     continue
+                if _funpay_is_rate_limit_error(e):
+                    _funpay_set_global_cooldown(75.0 + random.uniform(0.0, 30.0), f"send:{context}")
                 raise
 
 
@@ -1244,7 +1317,7 @@ def _funpay_listener_thread(loop: asyncio.AbstractEventLoop) -> None:
     _FUNPAY_LISTENER_THREAD_STARTED = True
     logging.info("FunPay listener started")
     try:
-        for event in runner.listen(requests_delay=4):
+        for event in runner.listen(requests_delay=_FUNPAY_LISTENER_REQUESTS_DELAY_SECONDS):
             try:
                 event_type = getattr(event, "type", None) or getattr(event, "event_type", None)
                 if event_type == getattr(FunPayEnums.EventTypes, "NEW_ORDER", None):
@@ -1293,26 +1366,44 @@ async def run_funpay_worker() -> None:
         try:
             golden_key = resolve_funpay_golden_key()
             if golden_key:
+                now_ts = asyncio.get_running_loop().time()
+                if _FUNPAY_SESSION_REFRESH_NEXT_RUN_TS <= 0:
+                    _schedule_next_funpay_session_refresh(now_ts, "warmup")
+                if now_ts >= _FUNPAY_SESSION_REFRESH_NEXT_RUN_TS:
+                    user_agent = resolve_funpay_user_agent()
+                    try:
+                        await asyncio.to_thread(
+                            _funpay_build_loaded_account_sync,
+                            golden_key,
+                            user_agent,
+                            True,
+                        )
+                        logging.info("FunPay session refreshed")
+                        _schedule_next_funpay_session_refresh(now_ts, "normal")
+                    except Exception as e:
+                        logging.warning("FunPay session refresh error: %s", e)
+                        _schedule_next_funpay_session_refresh(now_ts, "error")
                 if get_funpay_auto_raise_enabled():
                     if _FUNPAY_AUTO_RAISE_NEXT_RUN_TS <= 0:
-                        _schedule_next_funpay_auto_raise(asyncio.get_running_loop().time(), "warmup")
-                    if asyncio.get_running_loop().time() >= _FUNPAY_AUTO_RAISE_NEXT_RUN_TS:
+                        _schedule_next_funpay_auto_raise(now_ts, "warmup")
+                    if now_ts >= _FUNPAY_AUTO_RAISE_NEXT_RUN_TS:
                         raise_result = await funpay_raise_all_lots()
                         if raise_result.get("error"):
                             logging.error("FunPay auto raise error: %s", raise_result["error"])
-                            _schedule_next_funpay_auto_raise(asyncio.get_running_loop().time(), "error")
+                            _schedule_next_funpay_auto_raise(now_ts, "error")
                         else:
                             logging.info("FunPay auto raise completed: raised=%s errors=%s selected=%s total=%s",
                                          raise_result.get("raised"),
                                          raise_result.get("errors"),
                                          raise_result.get("selected_categories"),
                                          raise_result.get("total_categories"))
-                            _schedule_next_funpay_auto_raise(asyncio.get_running_loop().time(), "normal")
+                            _schedule_next_funpay_auto_raise(now_ts, "normal")
             else:
                 _clear_funpay_auto_raise_schedule()
+                _clear_funpay_session_refresh_schedule()
         except Exception as e:
             logging.exception("FunPay worker error: %s", e)
-        await asyncio.sleep(5)
+        await asyncio.sleep(10)
 
 
 def format_interval_seconds(seconds: int) -> str:
