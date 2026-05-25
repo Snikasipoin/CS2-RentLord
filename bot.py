@@ -1862,9 +1862,23 @@ def get_rent_statistics_text() -> str:
     )
     rows = cursor.fetchall()
 
+    cursor.execute("SELECT COUNT(*) FROM accounts WHERE status = 'busy'")
+    busy_accounts_row = cursor.fetchone()
+    busy_accounts = int(busy_accounts_row[0] or 0) if busy_accounts_row else 0
+
+    cursor.execute(
+        """
+        SELECT COUNT(*), COUNT(DISTINCT account_id)
+          FROM rent_history
+         WHERE actual_end_at IS NULL
+        """
+    )
+    open_history_row = cursor.fetchone()
+    open_history_rows = int(open_history_row[0] or 0) if open_history_row else 0
+    open_history_accounts = int(open_history_row[1] or 0) if open_history_row else 0
+
     now = datetime.now(timezone.utc)
     total = len(rows)
-    active = 0
     closed = 0
     manual_closed = 0
     auto_closed = 0
@@ -1883,9 +1897,7 @@ def get_rent_statistics_text() -> str:
             last_24h += 1
         if started_at and (now - started_at).total_seconds() <= 604800:
             last_7d += 1
-
         if actual_end is None:
-            active += 1
             continue
 
         closed += 1
@@ -1913,7 +1925,8 @@ def get_rent_statistics_text() -> str:
         "Статистика аренд:",
         "",
         f"Всего записей: {total}",
-        f"Активных сейчас: {active}",
+        f"Активных сейчас: {busy_accounts}",
+        f"Открытых записей в истории: {open_history_rows}",
         f"Завершено: {closed}",
         f"За 24 часа: {last_24h}",
         f"За 7 дней: {last_7d}",
@@ -1921,6 +1934,15 @@ def get_rent_statistics_text() -> str:
         f"Завершено вручную: {manual_closed}",
         f"Завершено автоматически: {auto_closed}",
     ]
+
+    if open_history_rows != busy_accounts or open_history_accounts != busy_accounts:
+        lines.extend([
+            "",
+            "⚠️ История и текущее состояние расходятся.",
+            f"По accounts занято: {busy_accounts}",
+            f"Открытых строк в истории: {open_history_rows}",
+            f"Уникальных занятых аккаунтов в истории: {open_history_accounts}",
+        ])
 
     if top_rows:
         lines.extend(["", "Топ аккаунтов:"])
