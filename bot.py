@@ -4330,10 +4330,19 @@ async def open_account_from_callback(callback: CallbackQuery, state: FSMContext)
     await state.update_data(selected_id=aid, selected_login=login)
     await state.set_state(AccountDetails.view_action)
     await callback.answer()
+    details_text = await build_account_details_text(row)
+
     if callback.message:
-        await callback.message.answer(await build_account_details_text(row), reply_markup=detail_actions_kb())
+        try:
+            # Заменяем карточку с данными для покупателя на карточку выбранного аккаунта.
+            await callback.message.edit_text(details_text, reply_markup=detail_actions_kb())
+            return
+        except Exception as e:
+            logging.warning(f"account_open edit_text fallback: {e}")
+
+        await callback.message.answer(details_text, reply_markup=detail_actions_kb())
     else:
-        await callback.bot.send_message(callback.from_user.id, await build_account_details_text(row), reply_markup=detail_actions_kb())
+        await callback.bot.send_message(callback.from_user.id, details_text, reply_markup=detail_actions_kb())
 
 
 @dp.message(StateFilter(AccountDetails.view_action))
