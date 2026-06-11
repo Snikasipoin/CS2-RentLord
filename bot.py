@@ -5759,7 +5759,7 @@ async def rent_enter_order(message: types.Message, state: FSMContext):
 
         await message.answer(
             "\n".join(buyer_text_lines),
-            reply_markup=copy_buffer_kb("\n".join(buyer_copy_lines), "Скопировать в буфер")
+            reply_markup=copy_buffer_kb("\n".join(buyer_copy_lines), "Скопировать в буфер", account_id=aid)
         )
 
         if order_id:
