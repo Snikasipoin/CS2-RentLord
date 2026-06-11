@@ -23,7 +23,7 @@ from cryptography.fernet import Fernet, InvalidToken
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CopyTextButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CopyTextButton, CallbackQuery
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
@@ -3716,14 +3716,23 @@ def rent_time_kb() -> ReplyKeyboardMarkup:
     )
 
 
-def copy_buffer_kb(copy_text: str, button_text: str = "Скопировать в буфер") -> InlineKeyboardMarkup | None:
+def copy_buffer_kb(
+    copy_text: str,
+    button_text: str = "Скопировать в буфер",
+    account_id: int | None = None,
+    account_button_text: str = "Перейти к аккаунту",
+) -> InlineKeyboardMarkup | None:
     value = (copy_text or "").strip()
     if not value or len(value) > 256:
         return None
 
+    row = [InlineKeyboardButton(text=button_text, copy_text=CopyTextButton(text=value))]
+    if account_id is not None:
+        row.append(InlineKeyboardButton(text=account_button_text, callback_data=f"account_open:{int(account_id)}"))
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=button_text, copy_text=CopyTextButton(text=value))]
+            row
         ]
     )
 
@@ -4303,6 +4312,30 @@ async def show_account_details(message: types.Message, state: FSMContext):
     await message.answer(await build_account_details_text(row), reply_markup=detail_actions_kb())
 
 
+@dp.callback_query(F.data.startswith("account_open:"))
+async def open_account_from_callback(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        return await callback.answer("Доступ запрещён", show_alert=True)
+
+    raw_id = (callback.data or "").split(":", 1)[1] if ":" in (callback.data or "") else ""
+    if not raw_id.isdigit():
+        return await callback.answer("Не удалось открыть аккаунт", show_alert=True)
+
+    aid = int(raw_id)
+    row = get_account_by_id(aid)
+    if not row:
+        return await callback.answer("Аккаунт не найден", show_alert=True)
+
+    login = row[0]
+    await state.update_data(selected_id=aid, selected_login=login)
+    await state.set_state(AccountDetails.view_action)
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(await build_account_details_text(row), reply_markup=detail_actions_kb())
+    else:
+        await callback.bot.send_message(callback.from_user.id, await build_account_details_text(row), reply_markup=detail_actions_kb())
+
+
 @dp.message(StateFilter(AccountDetails.view_action))
 async def account_detail_action(message: types.Message, state: FSMContext):
     txt = (message.text or "").strip().lower()
@@ -4359,7 +4392,7 @@ async def account_detail_action(message: types.Message, state: FSMContext):
             f"Steam Guard код для {row[0]}:\n"
             f"{code}\n"
             f"Код обновится через {seconds_left} сек.",
-            reply_markup=copy_buffer_kb(code, "Скопировать код")
+            reply_markup=copy_buffer_kb(code, "Скопировать код", account_id=aid)
         )
 
     if txt in {"2fa код", "код faceit", "код фэйсит", "код фейсит"}:
@@ -4387,7 +4420,7 @@ async def account_detail_action(message: types.Message, state: FSMContext):
             f"Faceit 2FA код для {row[0]}:\n"
             f"{code}\n"
             f"Код обновится через {seconds_left} сек.",
-            reply_markup=copy_buffer_kb(code, "Скопировать код")
+            reply_markup=copy_buffer_kb(code, "Скопировать код", account_id=aid)
         )
 
     if txt in {"код steam в заказ", "код faceit в заказ"}:

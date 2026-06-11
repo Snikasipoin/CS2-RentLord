@@ -364,6 +364,30 @@ def _funpay_extract_chat_id(chat_obj: Any) -> int | str | None:
     return None
 
 
+def _funpay_resolve_send_targets_sync(acc, chat_id: int | str) -> list[Any]:
+    targets: list[Any] = []
+    if chat_id is None:
+        return targets
+
+    if hasattr(acc, "get_chat"):
+        try:
+            chat_obj = acc.get_chat(chat_id)
+            if chat_obj is not None:
+                targets.append(chat_obj)
+        except Exception as e:
+            logging.debug("FunPay get_chat warmup failed for %s: %s", chat_id, e)
+
+    if chat_id not in targets:
+        targets.append(chat_id)
+
+    return targets
+
+
+def _funpay_sanitize_message_text(message_text: str | None) -> str:
+    text = (message_text or "")
+    return text.lstrip("\ufeff\u2064\u200b\u200c\u200d").strip()
+
+
 def _funpay_resolve_chat_by_buyer_name(acc, buyer_username: str | None) -> int | str | None:
     buyer_username = (buyer_username or "").strip()
     if not buyer_username:
@@ -393,6 +417,8 @@ def _funpay_resolve_chat_by_buyer_name(acc, buyer_username: str | None) -> int |
 def _funpay_send_message_with_retry_sync(acc, chat_id: int | str, message_text: str, *, context: str) -> None:
     with _FUNPAY_IO_LOCK:
         attempts = 2
+        message_text = _funpay_sanitize_message_text(message_text)
+        targets = _funpay_resolve_send_targets_sync(acc, chat_id)
         for attempt in range(attempts):
             try:
                 _funpay_wait_for_global_cooldown_sync(f"send:{context}")
@@ -404,9 +430,22 @@ def _funpay_send_message_with_retry_sync(acc, chat_id: int | str, message_text: 
                     if elapsed < min_gap:
                         sleep_for = min_gap - elapsed
                         time.sleep(sleep_for)
-                acc.send_message(chat_id, message_text)
-                _FUNPAY_LAST_SEND_TS = time.monotonic()
-                return
+                last_error: Exception | None = None
+                for target in targets:
+                    try:
+                        acc.send_message(target, message_text)
+                        _FUNPAY_LAST_SEND_TS = time.monotonic()
+                        return
+                    except Exception as send_error:
+                        last_error = send_error
+                        err_text = str(send_error)
+                        if "NoneType" in err_text and "text" in err_text:
+                            logging.warning("FunPay %s sent, but library raised harmless error: %s", context, err_text)
+                            _FUNPAY_LAST_SEND_TS = time.monotonic()
+                            return
+                if last_error is None:
+                    raise RuntimeError(f"FunPay send failed for {context}: no send targets available")
+                raise last_error
             except Exception as e:
                 err_text = str(e)
                 if "NoneType" in err_text and "text" in err_text:
