@@ -4314,6 +4314,12 @@ async def show_account_details(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("account_open:"))
 async def open_account_from_callback(callback: CallbackQuery, state: FSMContext):
+    logging.info(
+        "account_open callback received: user_id=%s data=%s",
+        getattr(callback.from_user, "id", None),
+        getattr(callback, "data", None),
+    )
+
     if callback.from_user.id not in ADMIN_IDS:
         return await callback.answer("Доступ запрещён", show_alert=True)
 
@@ -4329,20 +4335,15 @@ async def open_account_from_callback(callback: CallbackQuery, state: FSMContext)
     login = row[0]
     await state.update_data(selected_id=aid, selected_login=login)
     await state.set_state(AccountDetails.view_action)
-    await callback.answer()
+    await callback.answer("Аккаунт открыт")
     details_text = await build_account_details_text(row)
-
-    if callback.message:
-        try:
-            # Заменяем карточку с данными для покупателя на карточку выбранного аккаунта.
-            await callback.message.edit_text(details_text, reply_markup=detail_actions_kb())
-            return
-        except Exception as e:
-            logging.warning(f"account_open edit_text fallback: {e}")
-
-        await callback.message.answer(details_text, reply_markup=detail_actions_kb())
-    else:
-        await callback.bot.send_message(callback.from_user.id, details_text, reply_markup=detail_actions_kb())
+    # Не полагаемся на callback.message: в некоторых состояниях/клиентах это
+    # может быть "inaccessible" объект. Всегда отправляем карточку напрямую в чат администратора.
+    await callback.bot.send_message(
+        callback.from_user.id,
+        details_text,
+        reply_markup=detail_actions_kb(),
+    )
 
 
 @dp.message(StateFilter(AccountDetails.view_action))
