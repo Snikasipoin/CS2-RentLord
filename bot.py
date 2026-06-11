@@ -3643,12 +3643,12 @@ async def build_account_details_text(row) -> str:
 def detail_actions_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
+            [KeyboardButton(text="Назад")],
             [KeyboardButton(text="Код Steam"), KeyboardButton(text="Код Faceit")],
             [KeyboardButton(text="Код Steam в заказ"), KeyboardButton(text="Код Faceit в заказ")],
             [KeyboardButton(text="Блокировка Faceit"), KeyboardButton(text="Блокировка Steam")],
             [KeyboardButton(text="История аренд"), KeyboardButton(text="Дроп")],
             [KeyboardButton(text="Редактировать"), KeyboardButton(text="Удалить")],
-            [KeyboardButton(text="Назад")],
         ],
         resize_keyboard=True
     )
