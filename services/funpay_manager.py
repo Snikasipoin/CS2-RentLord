@@ -364,12 +364,15 @@ def _funpay_extract_chat_id(chat_obj: Any) -> int | str | None:
     return None
 
 
-def _funpay_resolve_send_targets_sync(acc, chat_id: int | str) -> list[Any]:
+def _funpay_resolve_send_targets_sync(acc, chat_id: int | str, buyer_username: str | None = None) -> list[Any]:
     targets: list[Any] = []
-    if chat_id is None:
-        return targets
 
-    if hasattr(acc, "get_chat"):
+    if buyer_username:
+        warm_target = _funpay_resolve_chat_object_by_buyer_name(acc, buyer_username)
+        if warm_target is not None:
+            targets.append(warm_target)
+
+    if chat_id is not None and hasattr(acc, "get_chat"):
         try:
             chat_obj = acc.get_chat(chat_id)
             if chat_obj is not None:
@@ -377,7 +380,7 @@ def _funpay_resolve_send_targets_sync(acc, chat_id: int | str) -> list[Any]:
         except Exception as e:
             logging.debug("FunPay get_chat warmup failed for %s: %s", chat_id, e)
 
-    if chat_id not in targets:
+    if chat_id is not None and chat_id not in targets:
         targets.append(chat_id)
 
     return targets
@@ -385,7 +388,9 @@ def _funpay_resolve_send_targets_sync(acc, chat_id: int | str) -> list[Any]:
 
 def _funpay_sanitize_message_text(message_text: str | None) -> str:
     text = (message_text or "")
-    return text.lstrip("\ufeff\u2064\u200b\u200c\u200d").strip()
+    for ch in ("\ufeff", "\u2064", "\u200b", "\u200c", "\u200d"):
+        text = text.replace(ch, "")
+    return text.strip()
 
 
 def _funpay_resolve_chat_by_buyer_name(acc, buyer_username: str | None) -> int | str | None:
@@ -414,11 +419,37 @@ def _funpay_resolve_chat_by_buyer_name(acc, buyer_username: str | None) -> int |
     return None
 
 
-def _funpay_send_message_with_retry_sync(acc, chat_id: int | str, message_text: str, *, context: str) -> None:
+def _funpay_resolve_chat_object_by_buyer_name(acc, buyer_username: str | None):
+    buyer_username = (buyer_username or "").strip()
+    if not buyer_username:
+        return None
+
+    method = getattr(acc, "get_chat_by_name", None)
+    if method is None:
+        return None
+
+    try:
+        try:
+            return method(buyer_username, True)
+        except TypeError:
+            return method(buyer_username)
+    except Exception as e:
+        logging.debug("FunPay chat object resolve failed by buyer name (%s): %s", buyer_username, e)
+        return None
+
+
+def _funpay_send_message_with_retry_sync(
+    acc,
+    chat_id: int | str,
+    message_text: str,
+    *,
+    context: str,
+    buyer_username: str | None = None,
+) -> None:
     with _FUNPAY_IO_LOCK:
-        attempts = 2
+        attempts = 3
         message_text = _funpay_sanitize_message_text(message_text)
-        targets = _funpay_resolve_send_targets_sync(acc, chat_id)
+        targets = _funpay_resolve_send_targets_sync(acc, chat_id, buyer_username)
         for attempt in range(attempts):
             try:
                 _funpay_wait_for_global_cooldown_sync(f"send:{context}")
@@ -433,7 +464,11 @@ def _funpay_send_message_with_retry_sync(acc, chat_id: int | str, message_text: 
                 last_error: Exception | None = None
                 for target in targets:
                     try:
-                        acc.send_message(target, message_text)
+                        send_method = getattr(target, "send_message", None)
+                        if callable(send_method):
+                            send_method(message_text)
+                        else:
+                            acc.send_message(target, message_text)
                         _FUNPAY_LAST_SEND_TS = time.monotonic()
                         return
                     except Exception as send_error:
@@ -452,11 +487,19 @@ def _funpay_send_message_with_retry_sync(acc, chat_id: int | str, message_text: 
                     logging.warning("FunPay %s sent, but library raised harmless error: %s", context, err_text)
                     _FUNPAY_LAST_SEND_TS = time.monotonic()
                     return
-                if _funpay_is_rate_limit_error(e) and attempt < attempts - 1:
-                    wait_seconds = 5.0 + attempt * 3.0
-                    logging.warning("FunPay rate limit detected while sending %s, retrying in %.1fs: %s", context, wait_seconds, err_text)
-                    _funpay_set_global_cooldown(wait_seconds + random.uniform(10.0, 20.0), f"send:{context}")
+                transient_runner_error = "https://funpay.com/runner/" in err_text and ("400" in err_text or "Ошибка запроса" in err_text)
+                if (_funpay_is_rate_limit_error(e) or transient_runner_error) and attempt < attempts - 1:
+                    wait_seconds = 3.0 + attempt * 4.0
+                    logging.warning(
+                        "FunPay send retry for %s in %.1fs: %s",
+                        context,
+                        wait_seconds,
+                        err_text,
+                    )
+                    _funpay_set_global_cooldown(wait_seconds + random.uniform(6.0, 15.0), f"send:{context}")
                     time.sleep(wait_seconds)
+                    if buyer_username:
+                        targets = _funpay_resolve_send_targets_sync(acc, chat_id, buyer_username)
                     continue
                 if _funpay_is_rate_limit_error(e):
                     _funpay_set_global_cooldown(75.0 + random.uniform(0.0, 30.0), f"send:{context}")
@@ -826,7 +869,13 @@ def _funpay_send_initial_order_message_sync(
         order_copy_lines.extend([f"Faceit email: {faceit_email_display}", f"Faceit пароль: {faceit_password_display}"])
 
     try:
-        _funpay_send_message_with_retry_sync(acc, chat_id, "\n".join(order_text_lines), context="initial order message")
+        _funpay_send_message_with_retry_sync(
+            acc,
+            chat_id,
+            "\n".join(order_text_lines),
+            context="initial order message",
+            buyer_username=buyer_username,
+        )
     except Exception as e:
         return {"error": f"Не удалось отправить данные в чат заказа: {e}"}
 
@@ -924,7 +973,13 @@ def _funpay_send_code_to_order_sync(
         return {"error": "Неизвестный тип кода"}
 
     try:
-        _funpay_send_message_with_retry_sync(acc, chat_id, message_text, context="order code")
+        _funpay_send_message_with_retry_sync(
+            acc,
+            chat_id,
+            message_text,
+            context="order code",
+            buyer_username=buyer_username,
+        )
     except Exception as e:
         return {"error": f"Не удалось отправить код в чат заказа: {e}"}
     return {"success": True, "chat_id": chat_id, "buyer_username": buyer_username, "code_type": code_type, "code": code}
