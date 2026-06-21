@@ -504,6 +504,33 @@ async def _funpay_engine_build_bot_async(user_agent: str | None = None):
         return FunPayEngineBot(**kwargs)
 
 
+async def _funpay_engine_close_bot_async(bot) -> None:
+    if bot is None:
+        return
+
+    close_candidates = []
+    for method_name in ("aclose", "close", "shutdown"):
+        method = getattr(bot, method_name, None)
+        if method is not None:
+            close_candidates.append(method)
+
+    session = getattr(bot, "session", None) or getattr(bot, "_session", None)
+    if session is not None:
+        for method_name in ("aclose", "close"):
+            method = getattr(session, method_name, None)
+            if method is not None:
+                close_candidates.append(method)
+
+    for method in close_candidates:
+        try:
+            result = method()
+            if inspect.isawaitable(result):
+                await result
+            return
+        except Exception:
+            continue
+
+
 async def _funpay_engine_resolve_order_record_async(order_id: str, user_agent: str | None = None) -> dict:
     bot = await _funpay_engine_build_bot_async(user_agent)
     normalized_id = str(order_id or "").strip().upper()
@@ -707,6 +734,7 @@ async def _funpay_engine_resolve_order_record_async(order_id: str, user_agent: s
         }
         return result
 
+    await _funpay_engine_close_bot_async(bot)
     return {
         "id": normalized_id,
         "description": "",
@@ -1076,6 +1104,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
         return cached_order
 
     acc = _funpay_build_loaded_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
+    bot = acc
 
     available_methods = [name for name in ("getNewOrders", "getLastOrders", "getDialogs") if hasattr(acc, name)]
     direct_lookup_errors: list[str] = []
@@ -1169,6 +1198,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
                     },
                 }
                 _funpay_cache_order(normalized_id, result)
+                asyncio.run(_funpay_engine_close_bot_async(bot))
                 return result
         except Exception as e:
             logging.error("FunPay direct order lookup error (%s): %s", method_name, _funpay_describe_response_error(e))
@@ -1258,6 +1288,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
             },
         }
         _funpay_cache_order(current_id, result)
+        asyncio.run(_funpay_engine_close_bot_async(bot))
         return result
 
     dialog_candidates: list[object] = []
@@ -1331,6 +1362,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
             },
         }
         _funpay_cache_order(normalized_id, result)
+        asyncio.run(_funpay_engine_close_bot_async(bot))
         return result
 
     return {
@@ -1939,12 +1971,15 @@ async def funpay_send_chat_message(chat_id: int | str, message_text: str, user_a
     if not golden_key:
         raise RuntimeError("FunPay golden key не задан")
     if _funpay_engine_backend_enabled():
+        bot = None
         try:
             bot = await _funpay_engine_build_bot_async(user_agent)
             await _funpay_engine_send_message_async(bot, chat_id, message_text, context="chat message")
             return
         except Exception as e:
             logging.warning("FunPayBotEngine chat send fallback to FunPayAPI: %s", _funpay_describe_response_error(e))
+        finally:
+    asyncio.run(_funpay_engine_close_bot_async(bot))
     await _funpay_submit_io_job("funpay_send_chat_message", _funpay_send_chat_message_sync, chat_id, message_text, user_agent)
 
 
@@ -1964,6 +1999,7 @@ async def funpay_send_initial_order_message(
     if not golden_key:
         return {"error": "FunPay golden key не задан"}
     if _funpay_engine_backend_enabled():
+        bot = None
         try:
             bot = await _funpay_engine_build_bot_async(user_agent)
             order = await _funpay_engine_resolve_order_record_async(order_id, user_agent)
@@ -2046,6 +2082,8 @@ async def funpay_send_initial_order_message(
         except Exception as e:
             logging.error("FunPayBotEngine initial order error: %s", _funpay_describe_response_error(e))
             return {"error": f"FunPayBotEngine initial order error: {_funpay_describe_response_error(e)}"}
+        finally:
+            await _funpay_engine_close_bot_async(bot)
     return await _funpay_submit_io_job(
         "funpay_send_initial_order_message",
         _funpay_send_initial_order_message_sync,
@@ -2077,6 +2115,7 @@ async def funpay_send_code_to_order(
     if not golden_key:
         return {"error": "FunPay golden key не задан"}
     if _funpay_engine_backend_enabled():
+        bot = None
         try:
             bot = await _funpay_engine_build_bot_async(user_agent)
             order = await _funpay_engine_resolve_order_record_async(order_id, user_agent)
@@ -2143,6 +2182,8 @@ async def funpay_send_code_to_order(
         except Exception as e:
             logging.error("FunPayBotEngine code send error: %s", _funpay_describe_response_error(e))
             return {"error": f"FunPayBotEngine code send error: {_funpay_describe_response_error(e)}"}
+        finally:
+            await _funpay_engine_close_bot_async(bot)
     return await _funpay_submit_io_job(
         "funpay_send_code_to_order",
         _funpay_send_code_to_order_sync,
