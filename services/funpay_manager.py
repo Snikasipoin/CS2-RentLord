@@ -2025,21 +2025,14 @@ async def funpay_send_initial_order_message(
                     f"Faceit пароль: {faceit_password_display}",
                 ])
 
-            if chat_target is not None:
-                await _funpay_engine_send_message_to_target_async(
-                    chat_target,
-                    "\n".join(order_text_lines),
-                    context="initial order message",
-                )
-            else:
-                await _funpay_engine_send_message_async(
-                    bot,
-                    chat_id,
-                    "\n".join(order_text_lines),
-                    buyer_username=None,
-                    context="initial order message",
-                    allow_buyer_lookup=False,
-                )
+            await _funpay_engine_send_message_async(
+                bot,
+                chat_id,
+                "\n".join(order_text_lines),
+                buyer_username=None,
+                context="initial order message",
+                allow_buyer_lookup=False,
+            )
             return {
                 "success": True,
                 "chat_id": chat_id,
@@ -2138,21 +2131,14 @@ async def funpay_send_code_to_order(
             else:
                 return {"error": "Неизвестный тип кода"}
 
-            if chat_target is not None:
-                await _funpay_engine_send_message_to_target_async(
-                    chat_target,
-                    message_text,
-                    context="order code",
-                )
-            else:
-                await _funpay_engine_send_message_async(
-                    bot,
-                    chat_id,
-                    message_text,
-                    buyer_username=None,
-                    context="order code",
-                    allow_buyer_lookup=False,
-                )
+            await _funpay_engine_send_message_async(
+                bot,
+                chat_id,
+                message_text,
+                buyer_username=None,
+                context="order code",
+                allow_buyer_lookup=False,
+            )
             return {"success": True, "chat_id": chat_id, "buyer_username": buyer_username, "code_type": code_type, "code": code}
         except Exception as e:
             logging.error("FunPayBotEngine code send error: %s", _funpay_describe_response_error(e))
