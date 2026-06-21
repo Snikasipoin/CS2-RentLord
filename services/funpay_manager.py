@@ -554,8 +554,50 @@ async def _funpay_engine_resolve_order_record_async(order_id: str, user_agent: s
 
             for candidate in candidates:
                 current_id = str(getattr(candidate, "id", "") or "").strip().upper()
-                text_parts = _funpay_collect_text_parts(candidate, ["description", "title", "name", "subject", "label", "text", "last_message", "last_text"])
-                if current_id != normalized_id and normalized_id not in " | ".join(text_parts).upper():
+                text_parts = _funpay_collect_text_parts(
+                    candidate,
+                    [
+                        "id",
+                        "order_id",
+                        "orderNumber",
+                        "order_number",
+                        "number",
+                        "description",
+                        "title",
+                        "name",
+                        "subject",
+                        "label",
+                        "text",
+                        "last_message",
+                        "last_text",
+                        "status",
+                        "state",
+                        "price",
+                        "sum",
+                        "url",
+                        "link",
+                        "href",
+                        "order",
+                        "chat",
+                        "dialog",
+                        "dialog_page",
+                        "page",
+                        "data",
+                        "result",
+                        "item",
+                        "items",
+                        "message",
+                        "messages",
+                        "user",
+                        "buyer_obj",
+                        "seller",
+                        "chat_id",
+                        "dialog_id",
+                        "buyer_username",
+                        "buyer",
+                    ],
+                )
+                if current_id != normalized_id and not _funpay_candidate_matches_order_id(candidate, normalized_id, text_parts):
                     continue
                 buyer_username = getattr(candidate, "buyer_username", None) or getattr(candidate, "buyer", None)
                 chat_id = getattr(candidate, "chat_id", None) or getattr(candidate, "dialog_id", None)
@@ -589,6 +631,81 @@ async def _funpay_engine_resolve_order_record_async(order_id: str, user_agent: s
                     },
                 }
                 return result
+
+    chat_page_method_names = ("get_chat_page", "get_chat_history", "get_chat")
+    for method_name in chat_page_method_names:
+        method = getattr(bot, method_name, None)
+        if method is None:
+            continue
+        try:
+            chat_payload = await _funpay_maybe_await(method(normalized_id))
+        except TypeError:
+            try:
+                chat_payload = await _funpay_maybe_await(method())
+            except Exception as e:
+                debug.setdefault("chat_lookup_errors", []).append(f"{method_name}:{e}")
+                continue
+        except Exception as e:
+            debug.setdefault("chat_lookup_errors", []).append(f"{method_name}:{e}")
+            continue
+
+        if not chat_payload:
+            continue
+
+        chat_target = chat_payload
+        chat_id = _funpay_extract_chat_id(chat_payload)
+        text_parts = _funpay_collect_text_parts(
+            chat_payload,
+            [
+                "id",
+                "chat_id",
+                "dialog_id",
+                "order_id",
+                "orderNumber",
+                "order_number",
+                "number",
+                "description",
+                "title",
+                "name",
+                "subject",
+                "text",
+                "last_message",
+                "last_text",
+                "order",
+                "chat",
+                "dialog",
+                "dialog_page",
+                "page",
+                "data",
+                "result",
+                "item",
+                "items",
+                "message",
+                "messages",
+                "buyer_username",
+                "buyer",
+                "username",
+                "user",
+                "seller",
+            ],
+        )
+        result = {
+            "id": normalized_id,
+            "description": " | ".join(text_parts),
+            "buyer_username": getattr(chat_payload, "buyer_username", None) or getattr(chat_payload, "buyer", None),
+            "chat_id": chat_id,
+            "chat_target": chat_target,
+            "status": _ctx().normalize_db_text(getattr(chat_payload, "status", None) or getattr(chat_payload, "state", None)),
+            "price": _ctx().normalize_db_text(getattr(chat_payload, "price", None) or getattr(chat_payload, "sum", None)),
+            "is_faceit": _funpay_detect_faceit_from_text(text_parts),
+            "debug": {
+                "matched": True,
+                "source": f"chat_lookup:{method_name}",
+                "available_methods": available_methods,
+                "text_parts": text_parts[:10],
+            },
+        }
+        return result
 
     return {
         "id": normalized_id,
@@ -859,20 +976,57 @@ def _funpay_send_message_with_retry_sync(
                 raise
 
 
-def _funpay_collect_text_parts(obj, field_names: list[str]) -> list[str]:
+def _funpay_collect_text_parts(obj, field_names: list[str], *, _depth: int = 0) -> list[str]:
     parts: list[str] = []
     for field_name in field_names:
         value = getattr(obj, field_name, None)
+        if value is None and isinstance(obj, dict):
+            value = obj.get(field_name)
         if value is None:
             continue
         if isinstance(value, (list, tuple, set)):
-            value = " ".join(str(item) for item in value if item is not None)
+            nested_parts = []
+            for item in value:
+                if item is None:
+                    continue
+                nested_parts.append(str(item))
+                if _depth < 1 and not isinstance(item, (str, bytes, int, float, bool)):
+                    nested_parts.extend(_funpay_collect_text_parts(item, field_names, _depth=_depth + 1))
+            value = " ".join(nested_parts)
         if isinstance(value, dict):
-            value = " ".join(f"{k}:{v}" for k, v in value.items() if v is not None)
+            dict_parts = [f"{k}:{v}" for k, v in value.items() if v is not None]
+            if _depth < 1:
+                for nested_value in value.values():
+                    if nested_value is None or isinstance(nested_value, (str, bytes, int, float, bool)):
+                        continue
+                    dict_parts.extend(_funpay_collect_text_parts(nested_value, field_names, _depth=_depth + 1))
+            value = " ".join(dict_parts)
         text = str(value).strip()
         if text:
             parts.append(text)
     return parts
+
+
+def _funpay_candidate_matches_order_id(candidate, normalized_id: str, text_parts: list[str]) -> bool:
+    if not normalized_id:
+        return False
+
+    text_blob = " | ".join(text_parts).upper()
+    if normalized_id in text_blob:
+        return True
+
+    for attr_name in ("id", "order_id", "orderNumber", "order_number", "number", "url", "link", "href"):
+        value = getattr(candidate, attr_name, None)
+        if value is None and isinstance(candidate, dict):
+            value = candidate.get(attr_name)
+        if value is None:
+            continue
+        if normalized_id == str(value).strip().upper():
+            return True
+        if normalized_id in str(value).strip().upper():
+            return True
+
+    return False
 
 
 def _funpay_detect_faceit_from_text(parts: list[str]) -> bool:
@@ -930,17 +1084,73 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
         if method is None:
             continue
         try:
-            direct_order = _funpay_call_with_retry_sync(method, normalized_id, retries=2, delay_seconds=5.0)
+            direct_order = None
+            lookup_args = [
+                (normalized_id,),
+                (normalized_id.lower(),),
+                (f"https://funpay.com/orders/{normalized_id}/",),
+            ]
+            if method_name in {"get_order", "getOrder"}:
+                lookup_args.append(tuple())
+            last_direct_error: Exception | None = None
+            for lookup_arg in lookup_args:
+                try:
+                    direct_order = _funpay_call_with_retry_sync(method, *lookup_arg, retries=2, delay_seconds=5.0)
+                    if direct_order:
+                        break
+                except Exception as inner_error:
+                    last_direct_error = inner_error
+                    continue
+            if direct_order is None and last_direct_error is not None:
+                raise last_direct_error
             if direct_order:
-                text_parts = _funpay_collect_text_parts(direct_order, ["description", "title", "name", "subject", "label", "text"])
+                text_parts = _funpay_collect_text_parts(
+                    direct_order,
+                    [
+                        "id",
+                        "order_id",
+                        "orderNumber",
+                        "order_number",
+                        "number",
+                        "description",
+                        "title",
+                        "name",
+                        "subject",
+                        "label",
+                        "text",
+                        "status",
+                        "state",
+                        "price",
+                        "sum",
+                        "url",
+                        "link",
+                        "href",
+                        "order",
+                        "chat",
+                        "dialog",
+                        "dialog_page",
+                        "page",
+                        "data",
+                        "result",
+                        "item",
+                        "items",
+                        "message",
+                        "messages",
+                        "user",
+                        "buyer_obj",
+                        "seller",
+                        "chat_id",
+                        "dialog_id",
+                        "buyer_username",
+                        "buyer",
+                    ],
+                )
                 description = " | ".join(text_parts)
                 buyer_username = getattr(direct_order, "buyer_username", None) or getattr(direct_order, "buyer", None)
                 chat_id = getattr(direct_order, "chat_id", None) or getattr(direct_order, "dialog_id", None)
                 if chat_id is None:
                     chat_obj = getattr(direct_order, "chat", None) or getattr(direct_order, "dialog", None)
                     chat_id = getattr(chat_obj, "id", None) if chat_obj is not None else None
-                if chat_id is None and buyer_username:
-                    chat_id = _funpay_resolve_chat_by_buyer_name(acc, buyer_username)
                 order_status = getattr(direct_order, "status", None) or getattr(direct_order, "state", None)
                 order_price = getattr(direct_order, "price", None) or getattr(direct_order, "sum", None)
                 result = {
@@ -983,15 +1193,53 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
         current_id = str(getattr(order, "id", "") or "").strip().upper()
         if current_id != normalized_id:
             continue
-        text_parts = _funpay_collect_text_parts(order, ["description", "title", "name", "subject", "label", "text"])
+        text_parts = _funpay_collect_text_parts(
+            order,
+            [
+                "id",
+                "order_id",
+                "orderNumber",
+                "order_number",
+                "number",
+                "description",
+                "title",
+                "name",
+                "subject",
+                "label",
+                "text",
+                "status",
+                "state",
+                "price",
+                "sum",
+                "url",
+                "link",
+                "href",
+                "order",
+                "chat",
+                "dialog",
+                "dialog_page",
+                "page",
+                "data",
+                "result",
+                "item",
+                "items",
+                "message",
+                "messages",
+                "user",
+                "buyer_obj",
+                "seller",
+                "chat_id",
+                "dialog_id",
+                "buyer_username",
+                "buyer",
+            ],
+        )
         description = " | ".join(text_parts)
         buyer_username = getattr(order, "buyer_username", None) or getattr(order, "buyer", None)
         chat_id = getattr(order, "chat_id", None) or getattr(order, "dialog_id", None)
         if chat_id is None:
             chat_obj = getattr(order, "chat", None) or getattr(order, "dialog", None)
             chat_id = getattr(chat_obj, "id", None) if chat_obj is not None else None
-        if chat_id is None and buyer_username:
-            chat_id = _funpay_resolve_chat_by_buyer_name(acc, buyer_username)
         order_status = getattr(order, "status", None) or getattr(order, "state", None)
         order_price = getattr(order, "price", None) or getattr(order, "sum", None)
         result = {
@@ -1024,7 +1272,41 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
         lookup_errors.append(f"getDialogs:{e}")
 
     for dialog in dialog_candidates:
-        dialog_text_parts = _funpay_collect_text_parts(dialog, ["description", "title", "name", "subject", "text", "last_message", "last_text"])
+        dialog_text_parts = _funpay_collect_text_parts(
+            dialog,
+            [
+                "id",
+                "chat_id",
+                "dialog_id",
+                "order_id",
+                "orderNumber",
+                "order_number",
+                "number",
+                "description",
+                "title",
+                "name",
+                "subject",
+                "text",
+                "last_message",
+                "last_text",
+                "order",
+                "chat",
+                "dialog",
+                "dialog_page",
+                "page",
+                "data",
+                "result",
+                "item",
+                "items",
+                "message",
+                "messages",
+                "buyer_username",
+                "buyer",
+                "username",
+                "user",
+                "seller",
+            ],
+        )
         dialog_text = " | ".join(dialog_text_parts)
         if normalized_id not in dialog_text.upper():
             continue
@@ -1769,7 +2051,8 @@ async def funpay_send_initial_order_message(
                 "copy_text": "\n".join(order_copy_lines),
             }
         except Exception as e:
-            logging.warning("FunPayBotEngine initial order fallback to FunPayAPI: %s", _funpay_describe_response_error(e))
+            logging.error("FunPayBotEngine initial order error: %s", _funpay_describe_response_error(e))
+            return {"error": f"FunPayBotEngine initial order error: {_funpay_describe_response_error(e)}"}
     return await _funpay_submit_io_job(
         "funpay_send_initial_order_message",
         _funpay_send_initial_order_message_sync,
@@ -1872,7 +2155,8 @@ async def funpay_send_code_to_order(
                 )
             return {"success": True, "chat_id": chat_id, "buyer_username": buyer_username, "code_type": code_type, "code": code}
         except Exception as e:
-            logging.warning("FunPayBotEngine code send fallback to FunPayAPI: %s", _funpay_describe_response_error(e))
+            logging.error("FunPayBotEngine code send error: %s", _funpay_describe_response_error(e))
+            return {"error": f"FunPayBotEngine code send error: {_funpay_describe_response_error(e)}"}
     return await _funpay_submit_io_job(
         "funpay_send_code_to_order",
         _funpay_send_code_to_order_sync,
