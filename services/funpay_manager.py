@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import random
 import re
@@ -19,6 +20,13 @@ except Exception:
     FunPayAccount = None
     FunPayRunner = None
     FunPayEnums = None
+
+try:
+    from funpaybotengine import Bot as FunPayEngineBot
+    from funpaybotengine import Dispatcher as FunPayEngineDispatcher
+except Exception:
+    FunPayEngineBot = None
+    FunPayEngineDispatcher = None
 
 
 @dataclass
@@ -84,6 +92,7 @@ _FUNPAY_MIN_SEND_INTERVAL_SECONDS = 3.0
 _FUNPAY_GLOBAL_COOLDOWN_UNTIL_TS = 0.0
 _FUNPAY_GLOBAL_COOLDOWN_REASON = ""
 _FUNPAY_LISTENER_REQUESTS_DELAY_SECONDS = 8
+_FUNPAY_BACKEND_MODE = (os.getenv("FUNPAY_BACKEND") or "auto").strip().lower()
 
 
 def configure(runtime: FunPayRuntime) -> None:
@@ -303,6 +312,55 @@ def _funpay_is_rate_limit_error(exc: Exception) -> bool:
     return "429" in text or "Too Many Requests" in text
 
 
+def _funpay_truncate(text: str | None, limit: int = 500) -> str:
+    if not text:
+        return ""
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit] + "…[truncated]"
+
+
+def _funpay_describe_response_error(exc: Exception) -> str:
+    """Читаемое описание ошибки FunPay с телом ОТВЕТА сервера.
+
+    Библиотека FunPayAPI в __str__ исключений печатает тело ЗАПРОСА, а тело
+    ответа FunPay добавляет только при log_response=True (для обычного HTTP
+    400 это False). Из-за этого реальная причина 400 («чат закрыт» и т.п.)
+    в логах не видна. Здесь мы вытаскиваем статус, error_message и тело
+    ответа напрямую из response-объекта исключения.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return str(exc)
+
+    parts: list[str] = []
+    request = getattr(response, "request", None)
+    method = getattr(request, "method", None) or "?"
+    url = getattr(response, "url", None) or getattr(request, "url", None) or "?"
+    status = getattr(exc, "status_code", None) or getattr(response, "status_code", None) or "?"
+
+    error_message = getattr(exc, "error_message", None)
+    if error_message:
+        parts.append(f"FunPay error_message: {error_message!r}")
+
+    parts.append(f"HTTP {status} {method} {url}")
+
+    # Тело ответа — главная цель: здесь FunPay пишет причину отказа.
+    body_text = ""
+    content = getattr(response, "content", None)
+    if content:
+        try:
+            if isinstance(content, bytes):
+                body_text = content.decode("utf-8", errors="replace")
+            else:
+                body_text = str(content)
+        except Exception:
+            body_text = repr(content)
+    if body_text:
+        parts.append(f"Response body: {_funpay_truncate(body_text, 500)}")
+
+    return " | ".join(parts)
+
+
 def _funpay_call_with_retry_sync(fn: Callable, *args, retries: int = 2, delay_seconds: float = 1.5, **kwargs):
     last_error: Exception | None = None
     attempt_total = max(1, int(retries))
@@ -318,7 +376,7 @@ def _funpay_call_with_retry_sync(fn: Callable, *args, retries: int = 2, delay_se
                     _funpay_set_global_cooldown(cooldown_seconds, f"rate_limit:{getattr(fn, '__name__', 'funpay_call')}")
                 raise
             wait_seconds = delay_seconds * (attempt + 1)
-            logging.warning("FunPay rate limit detected, retrying in %.1fs: %s", wait_seconds, e)
+            logging.warning("FunPay rate limit detected, retrying in %.1fs: %s", wait_seconds, _funpay_describe_response_error(e))
             _funpay_set_global_cooldown(wait_seconds + random.uniform(5.0, 15.0), f"retry:{getattr(fn, '__name__', 'funpay_call')}")
             time.sleep(wait_seconds)
     if last_error is not None:
@@ -391,6 +449,239 @@ def _funpay_sanitize_message_text(message_text: str | None) -> str:
     for ch in ("\ufeff", "\u2064", "\u200b", "\u200c", "\u200d"):
         text = text.replace(ch, "")
     return text.strip()
+
+
+def _funpay_backend_mode() -> str:
+    return _FUNPAY_BACKEND_MODE
+
+
+def _funpay_engine_backend_enabled() -> bool:
+    if FunPayEngineBot is None:
+        return False
+    return _funpay_backend_mode() in {"auto", "engine", "funpaybotengine"}
+
+
+async def _funpay_maybe_await(value):
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _funpay_call_candidate_method(obj, method_names: tuple[str, ...], *args, **kwargs):
+    if obj is None:
+        raise AttributeError("FunPay object is missing")
+    last_error: Exception | None = None
+    for method_name in method_names:
+        method = getattr(obj, method_name, None)
+        if method is None:
+            continue
+        try:
+            return await _funpay_maybe_await(method(*args, **kwargs))
+        except Exception as e:
+            last_error = e
+    if last_error is not None:
+        raise last_error
+    raise AttributeError(f"None of FunPay methods exist: {', '.join(method_names)}")
+
+
+async def _funpay_engine_build_bot_async(user_agent: str | None = None):
+    if not _funpay_engine_backend_enabled():
+        raise RuntimeError("FunPayBotEngine backend is disabled or unavailable")
+
+    golden_key = resolve_funpay_golden_key()
+    if not golden_key:
+        raise RuntimeError("FunPay golden key не задан")
+
+    kwargs = {"golden_key": golden_key}
+    if user_agent:
+        kwargs["user_agent"] = user_agent
+
+    try:
+        return FunPayEngineBot(**kwargs)
+    except TypeError:
+        kwargs.pop("user_agent", None)
+        return FunPayEngineBot(**kwargs)
+
+
+async def _funpay_engine_resolve_order_record_async(order_id: str, user_agent: str | None = None) -> dict:
+    bot = await _funpay_engine_build_bot_async(user_agent)
+    normalized_id = str(order_id or "").strip().upper()
+    if not normalized_id:
+        return {"error": "Пустой order_id"}
+
+    candidate_method_sets = (
+        ("get_order", "getOrder", "get_order_page", "getOrderPage"),
+        ("getNewOrders", "getLastOrders"),
+        ("getDialogs",),
+    )
+
+    debug: dict[str, Any] = {"matched": False, "backend": "funpaybotengine"}
+    available_methods = [name for name in (
+        "get_order",
+        "getOrder",
+        "get_order_page",
+        "getOrderPage",
+        "get_chat_by_name",
+        "get_chat_page",
+        "get_chat_history",
+        "getDialogs",
+        "getNewOrders",
+        "getLastOrders",
+    ) if hasattr(bot, name)]
+
+    for method_names in candidate_method_sets:
+        for method_name in method_names:
+            method = getattr(bot, method_name, None)
+            if method is None:
+                continue
+            try:
+                if method_name in {"getNewOrders", "getLastOrders", "getDialogs"}:
+                    payload = await _funpay_maybe_await(method())
+                else:
+                    payload = await _funpay_maybe_await(method(normalized_id))
+            except Exception as e:
+                debug.setdefault("lookup_errors", []).append(f"{method_name}:{e}")
+                continue
+
+            if not payload:
+                continue
+
+            if isinstance(payload, (list, tuple)):
+                candidates = payload
+            else:
+                candidates = [payload]
+
+            for candidate in candidates:
+                current_id = str(getattr(candidate, "id", "") or "").strip().upper()
+                text_parts = _funpay_collect_text_parts(candidate, ["description", "title", "name", "subject", "label", "text", "last_message", "last_text"])
+                if current_id != normalized_id and normalized_id not in " | ".join(text_parts).upper():
+                    continue
+                buyer_username = getattr(candidate, "buyer_username", None) or getattr(candidate, "buyer", None)
+                chat_id = getattr(candidate, "chat_id", None) or getattr(candidate, "dialog_id", None)
+                if chat_id is None:
+                    chat_obj = getattr(candidate, "chat", None) or getattr(candidate, "dialog", None) or getattr(candidate, "chat_page", None)
+                    chat_id = getattr(chat_obj, "id", None) if chat_obj is not None else None
+                if chat_id is None and buyer_username:
+                    try:
+                        chat_id = await _funpay_engine_resolve_chat_id_async(bot, buyer_username)
+                    except Exception as e:
+                        debug.setdefault("chat_errors", []).append(str(e))
+                order_status = getattr(candidate, "status", None) or getattr(candidate, "state", None)
+                order_price = getattr(candidate, "price", None) or getattr(candidate, "sum", None)
+                result = {
+                    "id": current_id or normalized_id,
+                    "description": " | ".join(text_parts),
+                    "buyer_username": buyer_username,
+                    "chat_id": chat_id,
+                    "status": _ctx().normalize_db_text(order_status),
+                    "price": _ctx().normalize_db_text(order_price),
+                    "is_faceit": _funpay_detect_faceit_from_text(text_parts),
+                    "debug": {
+                        "matched": True,
+                        "source": f"funpaybotengine:{method_name}",
+                        "available_methods": available_methods,
+                        "text_parts": text_parts[:10],
+                    },
+                }
+                return result
+
+    return {
+        "id": normalized_id,
+        "description": "",
+        "buyer_username": None,
+        "chat_id": None,
+        "status": None,
+        "price": None,
+        "is_faceit": False,
+        "debug": {
+            "matched": False,
+            "backend": "funpaybotengine",
+            "available_methods": available_methods,
+            "lookup_errors": debug.get("lookup_errors", []),
+        },
+    }
+
+
+async def _funpay_engine_resolve_chat_id_async(bot, buyer_username: str | None) -> int | str | None:
+    buyer_username = (buyer_username or "").strip()
+    if not buyer_username:
+        return None
+    for method_name in ("get_chat_by_name", "get_chat_page", "get_chat_history"):
+        method = getattr(bot, method_name, None)
+        if method is None:
+            continue
+        try:
+            try:
+                payload = await _funpay_maybe_await(method(buyer_username, True))
+            except TypeError:
+                payload = await _funpay_maybe_await(method(buyer_username))
+        except Exception:
+            continue
+        chat_id = _funpay_extract_chat_id(payload)
+        if chat_id is not None:
+            return chat_id
+    return None
+
+
+async def _funpay_engine_resolve_chat_target_async(bot, chat_id: int | str | None, buyer_username: str | None = None):
+    if buyer_username:
+        for method_name in ("get_chat_by_name", "get_chat_page", "get_chat_history"):
+            method = getattr(bot, method_name, None)
+            if method is None:
+                continue
+            try:
+                try:
+                    target = await _funpay_maybe_await(method(buyer_username, True))
+                except TypeError:
+                    target = await _funpay_maybe_await(method(buyer_username))
+                if target is not None:
+                    return target
+            except Exception:
+                continue
+
+    if chat_id is not None:
+        for method_name in ("get_chat_page", "get_chat_history", "get_chat"):
+            method = getattr(bot, method_name, None)
+            if method is None:
+                continue
+            try:
+                target = await _funpay_maybe_await(method(chat_id))
+                if target is not None:
+                    return target
+            except Exception:
+                continue
+    return None
+
+
+async def _funpay_engine_send_message_async(bot, chat_id: int | str | None, message_text: str, *, buyer_username: str | None = None, context: str) -> None:
+    message_text = _funpay_sanitize_message_text(message_text)
+    target = await _funpay_engine_resolve_chat_target_async(bot, chat_id, buyer_username)
+    candidate_targets = [target, chat_id, buyer_username]
+    send_method_names = ("send_message", "send", "message")
+
+    for candidate in candidate_targets:
+        if candidate is None:
+            continue
+        if hasattr(candidate, "send_message"):
+            try:
+                await _funpay_maybe_await(candidate.send_message(message_text))
+                return
+            except Exception as e:
+                if "NoneType" in str(e) and "text" in str(e):
+                    logging.warning("FunPay %s sent, but engine raised harmless error: %s", context, e)
+                    return
+        for method_name in send_method_names:
+            method = getattr(bot, method_name, None)
+            if method is None:
+                continue
+            try:
+                await _funpay_maybe_await(method(candidate, message_text))
+                return
+            except Exception as e:
+                if "NoneType" in str(e) and "text" in str(e):
+                    logging.warning("FunPay %s sent, but engine raised harmless error: %s", context, e)
+                    return
+    raise RuntimeError(f"Не удалось отправить сообщение через FunPayBotEngine: {context}")
 
 
 def _funpay_resolve_chat_by_buyer_name(acc, buyer_username: str | None) -> int | str | None:
@@ -482,8 +773,8 @@ def _funpay_send_message_with_retry_sync(
                     raise RuntimeError(f"FunPay send failed for {context}: no send targets available")
                 raise last_error
             except Exception as e:
-                err_text = str(e)
-                if "NoneType" in err_text and "text" in err_text:
+                err_text = _funpay_describe_response_error(e)
+                if "NoneType" in str(e) and "text" in str(e):
                     logging.warning("FunPay %s sent, but library raised harmless error: %s", context, err_text)
                     _FUNPAY_LAST_SEND_TS = time.monotonic()
                     return
@@ -608,7 +899,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
                 _funpay_cache_order(normalized_id, result)
                 return result
         except Exception as e:
-            logging.error("FunPay direct order lookup error (%s): %s", method_name, e)
+            logging.error("FunPay direct order lookup error (%s): %s", method_name, _funpay_describe_response_error(e))
             direct_lookup_errors.append(f"{method_name}:{e}")
 
     candidates: list[object] = []
@@ -623,7 +914,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
             candidates.extend(items)
             lookup_sources.append(f"{getter_name}:{len(items)}")
         except Exception as e:
-            logging.error("FunPay order lookup error (%s): %s", getter_name, e)
+            logging.error("FunPay order lookup error (%s): %s", getter_name, _funpay_describe_response_error(e))
             lookup_errors.append(f"{getter_name}:{e}")
 
     for order in candidates:
@@ -667,7 +958,7 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
             dialog_candidates.extend(items)
             lookup_sources.append(f"getDialogs:{len(items)}")
     except Exception as e:
-        logging.error("FunPay dialog lookup error: %s", e)
+        logging.error("FunPay dialog lookup error: %s", _funpay_describe_response_error(e))
         lookup_errors.append(f"getDialogs:{e}")
 
     for dialog in dialog_candidates:
@@ -1296,13 +1587,20 @@ async def _funpay_handle_chat_message(chat_id: int | None, author_id: int | None
         )
         _ctx().conn.commit()
     except Exception as e:
-        logging.error("funpay code send error: %s", e)
+        logging.error("funpay code send error: %s", _funpay_describe_response_error(e))
 
 
 async def funpay_send_chat_message(chat_id: int | str, message_text: str, user_agent: str | None = None) -> None:
     golden_key = resolve_funpay_golden_key()
     if not golden_key:
         raise RuntimeError("FunPay golden key не задан")
+    if _funpay_engine_backend_enabled():
+        try:
+            bot = await _funpay_engine_build_bot_async(user_agent)
+            await _funpay_engine_send_message_async(bot, chat_id, message_text, context="chat message")
+            return
+        except Exception as e:
+            logging.warning("FunPayBotEngine chat send fallback to FunPayAPI: %s", _funpay_describe_response_error(e))
     await _funpay_submit_io_job("funpay_send_chat_message", _funpay_send_chat_message_sync, chat_id, message_text, user_agent)
 
 
@@ -1321,6 +1619,86 @@ async def funpay_send_initial_order_message(
     golden_key = resolve_funpay_golden_key()
     if not golden_key:
         return {"error": "FunPay golden key не задан"}
+    if _funpay_engine_backend_enabled():
+        try:
+            bot = await _funpay_engine_build_bot_async(user_agent)
+            order = await _funpay_engine_resolve_order_record_async(order_id, user_agent)
+            if order.get("error"):
+                raise RuntimeError(order["error"])
+
+            buyer_username = order.get("buyer_username") or fallback_buyer_username
+            chat_id = order.get("chat_id") or fallback_chat_id
+            if chat_id is None and buyer_username:
+                chat_id = await _funpay_engine_resolve_chat_id_async(bot, buyer_username)
+            if not chat_id:
+                raise RuntimeError(
+                    "Не удалось определить чат заказа\n"
+                    + _funpay_format_order_debug_text(
+                        "initial_order_message",
+                        order,
+                        fallback_chat_id=fallback_chat_id,
+                        fallback_buyer_username=fallback_buyer_username,
+                        include_faceit=bool(order.get("is_faceit") and include_faceit),
+                    )
+                )
+
+            if persist_account_id is not None:
+                try:
+                    _ctx().set_funpay_order_context(
+                        persist_account_id,
+                        order.get("id") or str(order_id).strip().upper(),
+                        f"https://funpay.com/orders/{str(order.get('id') or str(order_id).strip().upper())}/",
+                        buyer_username,
+                        chat_id,
+                        order.get("status"),
+                        order.get("price"),
+                    )
+                    _ctx().conn.commit()
+                except Exception as e:
+                    logging.error("FunPay order context persist error: %s", e)
+
+            is_faceit_order = bool(order.get("is_faceit"))
+            order_text_lines = [
+                "Данные для покупателя:",
+                f"Steam логин: {steam_login}",
+                f"Steam пароль: {steam_password}",
+            ]
+            order_copy_lines = [
+                f"Steam логин: {steam_login}",
+                f"Steam пароль: {steam_password}",
+            ]
+            if is_faceit_order and include_faceit:
+                faceit_email_display = faceit_email or "-"
+                faceit_password_display = faceit_password or "-"
+                order_text_lines.extend([
+                    "",
+                    f"Faceit email: {faceit_email_display}",
+                    f"Faceit пароль: {faceit_password_display}",
+                ])
+                order_copy_lines.extend([
+                    f"Faceit email: {faceit_email_display}",
+                    f"Faceit пароль: {faceit_password_display}",
+                ])
+
+            await _funpay_engine_send_message_async(
+                bot,
+                chat_id,
+                "\n".join(order_text_lines),
+                buyer_username=buyer_username,
+                context="initial order message",
+            )
+            return {
+                "success": True,
+                "chat_id": chat_id,
+                "buyer_username": buyer_username,
+                "order_id": order.get("id"),
+                "order_status": order.get("status"),
+                "order_price": order.get("price"),
+                "is_faceit_order": is_faceit_order,
+                "copy_text": "\n".join(order_copy_lines),
+            }
+        except Exception as e:
+            logging.warning("FunPayBotEngine initial order fallback to FunPayAPI: %s", _funpay_describe_response_error(e))
     return await _funpay_submit_io_job(
         "funpay_send_initial_order_message",
         _funpay_send_initial_order_message_sync,
@@ -1351,6 +1729,70 @@ async def funpay_send_code_to_order(
     golden_key = resolve_funpay_golden_key()
     if not golden_key:
         return {"error": "FunPay golden key не задан"}
+    if _funpay_engine_backend_enabled():
+        try:
+            bot = await _funpay_engine_build_bot_async(user_agent)
+            order = await _funpay_engine_resolve_order_record_async(order_id, user_agent)
+            if order.get("error"):
+                raise RuntimeError(order["error"])
+
+            if code_type == "faceit" and not order.get("is_faceit"):
+                return {"error": "Этот заказ не FACEIT, код Faceit не требуется."}
+
+            buyer_username = order.get("buyer_username") or fallback_buyer_username
+            chat_id = order.get("chat_id") or fallback_chat_id
+            if chat_id is None and buyer_username:
+                chat_id = await _funpay_engine_resolve_chat_id_async(bot, buyer_username)
+            if not chat_id:
+                raise RuntimeError(
+                    "Не удалось определить чат заказа\n"
+                    + _funpay_format_order_debug_text(
+                        "send_order_code",
+                        order,
+                        fallback_chat_id=fallback_chat_id,
+                        fallback_buyer_username=fallback_buyer_username,
+                        extra_error=f"code_type={code_type}",
+                    )
+                )
+
+            if persist_account_id is not None:
+                try:
+                    _ctx().set_funpay_order_context(
+                        persist_account_id,
+                        order.get("id") or str(order_id).strip().upper(),
+                        f"https://funpay.com/orders/{str(order.get('id') or str(order_id).strip().upper())}/",
+                        buyer_username,
+                        chat_id,
+                        order.get("status"),
+                        order.get("price"),
+                    )
+                    _ctx().conn.commit()
+                except Exception as e:
+                    logging.error("FunPay order context persist error (code): %s", e)
+
+            if code_type == "steam":
+                if not steam_shared_secret:
+                    return {"error": "Steam shared secret не задан"}
+                code, _seconds_left = _ctx().generate_steam_guard_code(_ctx().decrypt(steam_shared_secret))
+                message_text = f"Steam Guard код" + (f" для аккаунта {account_login}" if account_login else "") + f": {code}"
+            elif code_type == "faceit":
+                if not faceit_2fa_secret:
+                    return {"error": "Faceit 2FA secret не задан"}
+                code, _seconds_left = _ctx().generate_totp_code(_ctx().decrypt(faceit_2fa_secret))
+                message_text = f"Faceit код" + (f" для аккаунта {account_login}" if account_login else "") + f": {code}"
+            else:
+                return {"error": "Неизвестный тип кода"}
+
+            await _funpay_engine_send_message_async(
+                bot,
+                chat_id,
+                message_text,
+                buyer_username=buyer_username,
+                context="order code",
+            )
+            return {"success": True, "chat_id": chat_id, "buyer_username": buyer_username, "code_type": code_type, "code": code}
+        except Exception as e:
+            logging.warning("FunPayBotEngine code send fallback to FunPayAPI: %s", _funpay_describe_response_error(e))
     return await _funpay_submit_io_job(
         "funpay_send_code_to_order",
         _funpay_send_code_to_order_sync,
@@ -1386,7 +1828,7 @@ async def run_funpay_io_worker() -> None:
             except Exception as e:
                 if not job.future.cancelled():
                     job.future.set_exception(e)
-                logging.error("FunPay job failed: %s: %s", job.label, e)
+                logging.error("FunPay job failed: %s: %s", job.label, _funpay_describe_response_error(e))
         except Exception as e:
             logging.exception("FunPay IO worker loop error: %s", e)
         finally:
@@ -1475,7 +1917,7 @@ async def run_funpay_worker() -> None:
                         logging.info("FunPay session refreshed")
                         _schedule_next_funpay_session_refresh(now_ts, "normal")
                     except Exception as e:
-                        logging.warning("FunPay session refresh error: %s", e)
+                        logging.warning("FunPay session refresh error: %s", _funpay_describe_response_error(e))
                         _schedule_next_funpay_session_refresh(now_ts, "error")
                 if get_funpay_auto_raise_enabled():
                     if _FUNPAY_AUTO_RAISE_NEXT_RUN_TS <= 0:
