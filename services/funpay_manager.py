@@ -1979,7 +1979,7 @@ async def funpay_send_chat_message(chat_id: int | str, message_text: str, user_a
         except Exception as e:
             logging.warning("FunPayBotEngine chat send fallback to FunPayAPI: %s", _funpay_describe_response_error(e))
         finally:
-    asyncio.run(_funpay_engine_close_bot_async(bot))
+            await _funpay_engine_close_bot_async(bot)
     await _funpay_submit_io_job("funpay_send_chat_message", _funpay_send_chat_message_sync, chat_id, message_text, user_agent)
 
 
