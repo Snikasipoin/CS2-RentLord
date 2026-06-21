@@ -559,14 +559,17 @@ async def _funpay_engine_resolve_order_record_async(order_id: str, user_agent: s
                     continue
                 buyer_username = getattr(candidate, "buyer_username", None) or getattr(candidate, "buyer", None)
                 chat_id = getattr(candidate, "chat_id", None) or getattr(candidate, "dialog_id", None)
+                chat_target = candidate if hasattr(candidate, "send_message") else None
                 if chat_id is None:
                     chat_obj = getattr(candidate, "chat", None) or getattr(candidate, "dialog", None) or getattr(candidate, "chat_page", None)
+                    if chat_target is None and chat_obj is not None:
+                        chat_target = chat_obj
                     chat_id = getattr(chat_obj, "id", None) if chat_obj is not None else None
-                if chat_id is None and buyer_username:
-                    try:
-                        chat_id = await _funpay_engine_resolve_chat_id_async(bot, buyer_username)
-                    except Exception as e:
-                        debug.setdefault("chat_errors", []).append(str(e))
+                if chat_target is None and chat_id is None:
+                    resolved_chat_target = await _funpay_engine_resolve_chat_target_from_order_async(candidate)
+                    if resolved_chat_target is not None:
+                        chat_target = resolved_chat_target
+                        chat_id = _funpay_extract_chat_id(chat_target)
                 order_status = getattr(candidate, "status", None) or getattr(candidate, "state", None)
                 order_price = getattr(candidate, "price", None) or getattr(candidate, "sum", None)
                 result = {
@@ -574,6 +577,7 @@ async def _funpay_engine_resolve_order_record_async(order_id: str, user_agent: s
                     "description": " | ".join(text_parts),
                     "buyer_username": buyer_username,
                     "chat_id": chat_id,
+                    "chat_target": chat_target,
                     "status": _ctx().normalize_db_text(order_status),
                     "price": _ctx().normalize_db_text(order_price),
                     "is_faceit": _funpay_detect_faceit_from_text(text_parts),
@@ -591,6 +595,7 @@ async def _funpay_engine_resolve_order_record_async(order_id: str, user_agent: s
         "description": "",
         "buyer_username": None,
         "chat_id": None,
+        "chat_target": None,
         "status": None,
         "price": None,
         "is_faceit": False,
@@ -624,6 +629,30 @@ async def _funpay_engine_resolve_chat_id_async(bot, buyer_username: str | None) 
     return None
 
 
+async def _funpay_engine_resolve_chat_target_from_order_async(order_obj) -> Any | None:
+    if order_obj is None:
+        return None
+    if hasattr(order_obj, "send_message"):
+        return order_obj
+
+    for method_name in ("get_chat_page", "get_chat_history", "get_chat"):
+        method = getattr(order_obj, method_name, None)
+        if method is None:
+            continue
+        try:
+            target = await _funpay_maybe_await(method())
+        except TypeError:
+            try:
+                target = await _funpay_maybe_await(method(order_obj))
+            except Exception:
+                continue
+        except Exception:
+            continue
+        if target is not None:
+            return target
+    return None
+
+
 async def _funpay_engine_resolve_chat_target_async(bot, chat_id: int | str | None, buyer_username: str | None = None):
     if buyer_username:
         for method_name in ("get_chat_by_name", "get_chat_page", "get_chat_history"):
@@ -654,10 +683,24 @@ async def _funpay_engine_resolve_chat_target_async(bot, chat_id: int | str | Non
     return None
 
 
-async def _funpay_engine_send_message_async(bot, chat_id: int | str | None, message_text: str, *, buyer_username: str | None = None, context: str) -> None:
+async def _funpay_engine_send_message_async(
+    bot,
+    chat_id: int | str | None,
+    message_text: str,
+    *,
+    buyer_username: str | None = None,
+    context: str,
+    allow_buyer_lookup: bool = False,
+) -> None:
     message_text = _funpay_sanitize_message_text(message_text)
-    target = await _funpay_engine_resolve_chat_target_async(bot, chat_id, buyer_username)
-    candidate_targets = [target, chat_id, buyer_username]
+    target = None
+    if chat_id is not None:
+        target = await _funpay_engine_resolve_chat_target_async(bot, chat_id, None)
+    if target is None and allow_buyer_lookup:
+        target = await _funpay_engine_resolve_chat_target_async(bot, None, buyer_username)
+    candidate_targets = [target, chat_id]
+    if allow_buyer_lookup and buyer_username:
+        candidate_targets.append(buyer_username)
     send_method_names = ("send_message", "send", "message")
 
     for candidate in candidate_targets:
@@ -683,6 +726,24 @@ async def _funpay_engine_send_message_async(bot, chat_id: int | str | None, mess
                     logging.warning("FunPay %s sent, but engine raised harmless error: %s", context, e)
                     return
     raise RuntimeError(f"Не удалось отправить сообщение через FunPayBotEngine: {context}")
+
+
+async def _funpay_engine_send_message_to_target_async(target, message_text: str, *, context: str) -> None:
+    message_text = _funpay_sanitize_message_text(message_text)
+    if target is None:
+        raise RuntimeError(f"No FunPay target available for {context}")
+
+    if hasattr(target, "send_message"):
+        try:
+            await _funpay_maybe_await(target.send_message(message_text))
+            return
+        except Exception as e:
+            if "NoneType" in str(e) and "text" in str(e):
+                logging.warning("FunPay %s sent, but engine raised harmless error: %s", context, e)
+                return
+            raise
+
+    raise RuntimeError(f"Target does not support send_message for {context}")
 
 
 def _funpay_resolve_chat_by_buyer_name(acc, buyer_username: str | None) -> int | str | None:
@@ -1629,9 +1690,10 @@ async def funpay_send_initial_order_message(
 
             buyer_username = order.get("buyer_username") or fallback_buyer_username
             chat_id = order.get("chat_id") or fallback_chat_id
-            if chat_id is None and buyer_username:
-                chat_id = await _funpay_engine_resolve_chat_id_async(bot, buyer_username)
-            if not chat_id:
+            chat_target = order.get("chat_target")
+            if chat_id is None and chat_target is not None:
+                chat_id = _funpay_extract_chat_id(chat_target)
+            if chat_target is None and chat_id is None:
                 raise RuntimeError(
                     "Не удалось определить чат заказа\n"
                     + _funpay_format_order_debug_text(
@@ -1681,13 +1743,21 @@ async def funpay_send_initial_order_message(
                     f"Faceit пароль: {faceit_password_display}",
                 ])
 
-            await _funpay_engine_send_message_async(
-                bot,
-                chat_id,
-                "\n".join(order_text_lines),
-                buyer_username=buyer_username,
-                context="initial order message",
-            )
+            if chat_target is not None:
+                await _funpay_engine_send_message_to_target_async(
+                    chat_target,
+                    "\n".join(order_text_lines),
+                    context="initial order message",
+                )
+            else:
+                await _funpay_engine_send_message_async(
+                    bot,
+                    chat_id,
+                    "\n".join(order_text_lines),
+                    buyer_username=None,
+                    context="initial order message",
+                    allow_buyer_lookup=False,
+                )
             return {
                 "success": True,
                 "chat_id": chat_id,
@@ -1742,9 +1812,10 @@ async def funpay_send_code_to_order(
 
             buyer_username = order.get("buyer_username") or fallback_buyer_username
             chat_id = order.get("chat_id") or fallback_chat_id
-            if chat_id is None and buyer_username:
-                chat_id = await _funpay_engine_resolve_chat_id_async(bot, buyer_username)
-            if not chat_id:
+            chat_target = order.get("chat_target")
+            if chat_id is None and chat_target is not None:
+                chat_id = _funpay_extract_chat_id(chat_target)
+            if chat_target is None and chat_id is None:
                 raise RuntimeError(
                     "Не удалось определить чат заказа\n"
                     + _funpay_format_order_debug_text(
@@ -1784,13 +1855,21 @@ async def funpay_send_code_to_order(
             else:
                 return {"error": "Неизвестный тип кода"}
 
-            await _funpay_engine_send_message_async(
-                bot,
-                chat_id,
-                message_text,
-                buyer_username=buyer_username,
-                context="order code",
-            )
+            if chat_target is not None:
+                await _funpay_engine_send_message_to_target_async(
+                    chat_target,
+                    message_text,
+                    context="order code",
+                )
+            else:
+                await _funpay_engine_send_message_async(
+                    bot,
+                    chat_id,
+                    message_text,
+                    buyer_username=None,
+                    context="order code",
+                    allow_buyer_lookup=False,
+                )
             return {"success": True, "chat_id": chat_id, "buyer_username": buyer_username, "code_type": code_type, "code": code}
         except Exception as e:
             logging.warning("FunPayBotEngine code send fallback to FunPayAPI: %s", _funpay_describe_response_error(e))
