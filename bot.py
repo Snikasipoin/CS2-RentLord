@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import sqlite3
 import logging
 import os
@@ -4419,6 +4419,13 @@ async def account_detail_action(message: types.Message, state: FSMContext):
                 reply_markup=detail_actions_kb()
             )
 
+        if not order_id and not chat_id and not buyer_username:
+            return await message.answer(
+                "У аккаунта не привязан FunPay заказ или чат покупателя.\n"
+                "Сначала укажите заказ при сдаче или дождитесь синхронизации FunPay.",
+                reply_markup=detail_actions_kb()
+            )
+
         try:
             result = await funpay_send_code_to_order(
                 order_id or "",
@@ -4427,6 +4434,8 @@ async def account_detail_action(message: types.Message, state: FSMContext):
                 steam_shared_secret,
                 faceit_2fa_secret,
                 aid,
+                chat_id,
+                buyer_username,
             )
             if result.get("error"):
                 return await message.answer(str(result["error"]), reply_markup=detail_actions_kb())
@@ -6184,7 +6193,13 @@ async def main():
     asyncio.create_task(run_funpay_io_worker())
     asyncio.create_task(run_funpay_worker())
     print("Бот запущен")
-    await dp.start_polling(bot, allowed_updates=["message"])
+    try:
+        await dp.start_polling(bot, allowed_updates=["message"])
+    finally:
+        try:
+            await bot.session.close()
+        except Exception as e:
+            logging.debug("bot session close error: %s", e)
 
 if __name__ == "__main__":
     asyncio.run(main())

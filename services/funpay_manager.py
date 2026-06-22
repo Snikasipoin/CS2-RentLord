@@ -242,6 +242,19 @@ def _funpay_wait_for_global_cooldown_sync(context: str) -> None:
     time.sleep(remaining)
 
 
+async def _funpay_wait_for_global_cooldown_async(context: str) -> None:
+    remaining = _FUNPAY_GLOBAL_COOLDOWN_UNTIL_TS - time.monotonic()
+    if remaining <= 0:
+        return
+    logging.info(
+        "FunPay global cooldown active before %s (%s), sleeping %.1fs",
+        context,
+        _FUNPAY_GLOBAL_COOLDOWN_REASON or "unknown",
+        remaining,
+    )
+    await asyncio.sleep(remaining)
+
+
 def funpay_toggle_auto_raise() -> bool:
     global _FUNPAY_AUTO_RAISE_LAST_RUN
     cursor = _ctx().conn.cursor()
@@ -508,31 +521,74 @@ async def _funpay_engine_close_bot_async(bot) -> None:
     if bot is None:
         return
 
-    close_candidates = []
-    for method_name in ("aclose", "close", "shutdown"):
-        method = getattr(bot, method_name, None)
-        if method is not None:
-            close_candidates.append(method)
-
-    session = getattr(bot, "session", None) or getattr(bot, "_session", None)
-    if session is not None:
-        for method_name in ("aclose", "close"):
-            method = getattr(session, method_name, None)
-            if method is not None:
-                close_candidates.append(method)
-
-    for method in close_candidates:
+    async def _call_close(method) -> None:
+        if method is None or not callable(method):
+            return
         try:
             result = method()
             if inspect.isawaitable(result):
                 await result
-            return
         except Exception:
-            continue
+            pass
+
+    sessions = []
+    for attr_name in ("session", "_session", "http", "_http", "client", "_client"):
+        session = getattr(bot, attr_name, None)
+        if session is not None and session not in sessions:
+            sessions.append(session)
+
+    for session in sessions:
+        await _call_close(getattr(session, "aclose", None))
+        await _call_close(getattr(session, "close", None))
+        connector = getattr(session, "connector", None)
+        if connector is not None:
+            await _call_close(getattr(connector, "close", None))
+
+    for method_name in ("aclose", "close", "shutdown"):
+        await _call_close(getattr(bot, method_name, None))
 
 
-async def _funpay_engine_resolve_order_record_async(order_id: str, user_agent: str | None = None) -> dict:
-    bot = await _funpay_engine_build_bot_async(user_agent)
+def _funpay_fallback_order_record(
+    fallback_chat_id: int | str | None,
+    fallback_buyer_username: str | None,
+    *,
+    assume_faceit: bool = False,
+) -> dict:
+    return {
+        "id": None,
+        "description": "",
+        "buyer_username": fallback_buyer_username,
+        "chat_id": fallback_chat_id,
+        "chat_target": None,
+        "status": None,
+        "price": None,
+        "is_faceit": assume_faceit,
+        "debug": {"matched": False, "source": "fallback"},
+    }
+
+
+def _funpay_missing_order_id_error() -> dict:
+    return {
+        "error": (
+            "Не задан номер заказа FunPay. "
+            "Укажите заказ при сдаче или сохраните chat_id/покупателя для аккаунта."
+        )
+    }
+
+
+async def _funpay_engine_resolve_order_record_async(
+    order_id: str,
+    user_agent: str | None = None,
+    *,
+    bot=None,
+) -> dict:
+    if bot is None:
+        created_bot = await _funpay_engine_build_bot_async(user_agent)
+        try:
+            return await _funpay_engine_resolve_order_record_async(order_id, user_agent, bot=created_bot)
+        finally:
+            await _funpay_engine_close_bot_async(created_bot)
+
     normalized_id = str(order_id or "").strip().upper()
     if not normalized_id:
         return {"error": "Пустой order_id"}
@@ -734,7 +790,6 @@ async def _funpay_engine_resolve_order_record_async(order_id: str, user_agent: s
         }
         return result
 
-    await _funpay_engine_close_bot_async(bot)
     return {
         "id": normalized_id,
         "description": "",
@@ -1203,6 +1258,8 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
         except Exception as e:
             logging.error("FunPay direct order lookup error (%s): %s", method_name, _funpay_describe_response_error(e))
             direct_lookup_errors.append(f"{method_name}:{e}")
+            if _funpay_is_rate_limit_error(e):
+                _funpay_set_global_cooldown(random.uniform(60.0, 120.0), f"lookup:{method_name}")
 
     candidates: list[object] = []
     lookup_sources: list[str] = []
@@ -1218,6 +1275,8 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
         except Exception as e:
             logging.error("FunPay order lookup error (%s): %s", getter_name, _funpay_describe_response_error(e))
             lookup_errors.append(f"{getter_name}:{e}")
+            if _funpay_is_rate_limit_error(e):
+                _funpay_set_global_cooldown(random.uniform(60.0, 120.0), f"lookup:{getter_name}")
 
     for order in candidates:
         current_id = str(getattr(order, "id", "") or "").strip().upper()
@@ -1301,6 +1360,8 @@ def _funpay_find_order_record_sync(order_id: str, user_agent: str | None = None)
     except Exception as e:
         logging.error("FunPay dialog lookup error: %s", _funpay_describe_response_error(e))
         lookup_errors.append(f"getDialogs:{e}")
+        if _funpay_is_rate_limit_error(e):
+            _funpay_set_global_cooldown(random.uniform(60.0, 120.0), "lookup:getDialogs")
 
     for dialog in dialog_candidates:
         dialog_text_parts = _funpay_collect_text_parts(
@@ -1575,11 +1636,21 @@ def _funpay_send_code_to_order_sync(
         return {"error": "FunPay golden key не задан"}
 
     acc = _funpay_build_loaded_account_sync(golden_key, user_agent or resolve_funpay_user_agent())
-    order = _funpay_find_order_record_sync(order_id, user_agent)
-    if order.get("error"):
-        return order
+    normalized_id = str(order_id or "").strip().upper()
+    if not normalized_id:
+        if not fallback_chat_id and not fallback_buyer_username:
+            return _funpay_missing_order_id_error()
+        order = _funpay_fallback_order_record(
+            fallback_chat_id,
+            fallback_buyer_username,
+            assume_faceit=(code_type == "faceit"),
+        )
+    else:
+        order = _funpay_find_order_record_sync(order_id, user_agent)
+        if order.get("error"):
+            return order
 
-    if code_type == "faceit" and not order.get("is_faceit"):
+    if code_type == "faceit" and normalized_id and not order.get("is_faceit"):
         return {"error": "Этот заказ не FACEIT, код Faceit не требуется."}
 
     buyer_username = order.get("buyer_username") or fallback_buyer_username
@@ -2002,7 +2073,10 @@ async def funpay_send_initial_order_message(
         bot = None
         try:
             bot = await _funpay_engine_build_bot_async(user_agent)
-            order = await _funpay_engine_resolve_order_record_async(order_id, user_agent)
+            normalized_id = str(order_id or "").strip().upper()
+            if not normalized_id:
+                return _funpay_missing_order_id_error()
+            order = await _funpay_engine_resolve_order_record_async(normalized_id, user_agent, bot=bot)
             if order.get("error"):
                 raise RuntimeError(order["error"])
 
@@ -2025,10 +2099,12 @@ async def funpay_send_initial_order_message(
 
             if persist_account_id is not None:
                 try:
+                    resolved_order_id = order.get("id") or (normalized_id or None)
+                    order_url = f"https://funpay.com/orders/{resolved_order_id}/" if resolved_order_id else None
                     _ctx().set_funpay_order_context(
                         persist_account_id,
-                        order.get("id") or str(order_id).strip().upper(),
-                        f"https://funpay.com/orders/{str(order.get('id') or str(order_id).strip().upper())}/",
+                        resolved_order_id,
+                        order_url,
                         buyer_username,
                         chat_id,
                         order.get("status"),
@@ -2118,11 +2194,21 @@ async def funpay_send_code_to_order(
         bot = None
         try:
             bot = await _funpay_engine_build_bot_async(user_agent)
-            order = await _funpay_engine_resolve_order_record_async(order_id, user_agent)
-            if order.get("error"):
-                raise RuntimeError(order["error"])
+            normalized_id = str(order_id or "").strip().upper()
+            if not normalized_id:
+                if not fallback_chat_id and not fallback_buyer_username:
+                    return _funpay_missing_order_id_error()
+                order = _funpay_fallback_order_record(
+                    fallback_chat_id,
+                    fallback_buyer_username,
+                    assume_faceit=(code_type == "faceit"),
+                )
+            else:
+                order = await _funpay_engine_resolve_order_record_async(normalized_id, user_agent, bot=bot)
+                if order.get("error"):
+                    raise RuntimeError(order["error"])
 
-            if code_type == "faceit" and not order.get("is_faceit"):
+            if code_type == "faceit" and normalized_id and not order.get("is_faceit"):
                 return {"error": "Этот заказ не FACEIT, код Faceit не требуется."}
 
             buyer_username = order.get("buyer_username") or fallback_buyer_username
@@ -2130,7 +2216,9 @@ async def funpay_send_code_to_order(
             chat_target = order.get("chat_target")
             if chat_id is None and chat_target is not None:
                 chat_id = _funpay_extract_chat_id(chat_target)
-            if chat_target is None and chat_id is None:
+            if chat_id is None and buyer_username:
+                chat_id = await _funpay_engine_resolve_chat_id_async(bot, buyer_username)
+            if chat_id is None and buyer_username is None:
                 raise RuntimeError(
                     "Не удалось определить чат заказа\n"
                     + _funpay_format_order_debug_text(
@@ -2144,10 +2232,12 @@ async def funpay_send_code_to_order(
 
             if persist_account_id is not None:
                 try:
+                    resolved_order_id = order.get("id") or (normalized_id or None)
+                    order_url = f"https://funpay.com/orders/{resolved_order_id}/" if resolved_order_id else None
                     _ctx().set_funpay_order_context(
                         persist_account_id,
-                        order.get("id") or str(order_id).strip().upper(),
-                        f"https://funpay.com/orders/{str(order.get('id') or str(order_id).strip().upper())}/",
+                        resolved_order_id,
+                        order_url,
                         buyer_username,
                         chat_id,
                         order.get("status"),
@@ -2174,9 +2264,9 @@ async def funpay_send_code_to_order(
                 bot,
                 chat_id,
                 message_text,
-                buyer_username=None,
+                buyer_username=buyer_username,
                 context="order code",
-                allow_buyer_lookup=False,
+                allow_buyer_lookup=bool(buyer_username and chat_id is None),
             )
             return {"success": True, "chat_id": chat_id, "buyer_username": buyer_username, "code_type": code_type, "code": code}
         except Exception as e:
